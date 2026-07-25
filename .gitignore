@@ -10,3 +10,4 @@ wheels/
 .venv
 catalogs/
 data/
+data_downloaded/
