@@ -1,3 +1,4 @@
+import functools
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -10,6 +11,7 @@ EARTHQUAKE_BATCHES = [
     ("window_pre_200s", -200, 0),
     ("window_post_60s", 0, 60),
     ("window_extended", -30, 300),
+    ("window_post_200s", 0, 200),
 ]
 
 # Noise waveform windows: (window_name, start_offset_sec, end_offset_sec)
@@ -21,10 +23,28 @@ NOISE_BATCHES = [
 # General Settings
 CATALOG_FILE = Path("catalogs/extracted_earthquakes.csv")
 BASE_OUTPUT_DIR = Path("data")
-FILE_LIMIT = 1000  # Set to None to process the full catalog
+FILE_LIMIT = 10000  # Set to None to process the full catalog
 SEARCH_RADIUS_DEG = 0.5  # ~55 km radius around event
 FDSN_CLIENT = "KOERI"
 MAX_WORKERS = 6  # Number of concurrent threads
+
+
+@functools.lru_cache(maxsize=2048)
+def fetch_station_queries(lat_round: float, lon_round: float, radius: float, client_name: str) -> tuple:
+  """
+  Caches station metadata. If events occur within ~1.1km of each other 
+  (rounded to 2 decimal places), it instantly reuses the station list 
+  instead of making a slow network request.
+  """
+  client = Client(client_name)
+  try:
+    inventory = client.get_stations(
+        latitude=lat_round, longitude=lon_round, maxradius=radius, channel="HH*"
+    )
+    queries = [(net.code, sta.code, "*", "HH*") for net in inventory for sta in net]
+    return tuple(queries)
+  except Exception:
+    return ()
 
 
 def process_event_and_noise(
@@ -41,82 +61,83 @@ def process_event_and_noise(
     lat = float(row["Latitude"])
     lon = float(row["Longitude"])
 
-    # Query nearby stations once per event location
-    inventory = client.get_stations(
-        latitude=lat, longitude=lon, maxradius=SEARCH_RADIUS_DEG, channel="HH*"
-    )
+    # OPTIMIZATION 1: Use cached station queries
+    lat_round, lon_round = round(lat, 2), round(lon, 2)
+    station_queries = fetch_station_queries(lat_round, lon_round, SEARCH_RADIUS_DEG, FDSN_CLIENT)
 
-    if not inventory:
+    if not station_queries:
       return f"[warning] No stations found for EventID location {event_id}"
 
-    station_queries = [
-        (net.code, sta.code, "*", "HH*") for net in inventory for sta in net
-    ]
-
     results = []
+    bulk_query = []
+    tasks_to_slice = []  # Tracks which windows to extract from the master stream
 
-    # PROCESS EARTHQUAKE BATCHES
+    # --- PREPARE EARTHQUAKE BATCHES ---
     eq_output_base = output_base_dir / "batched_waveforms"
     for batch_name, start_offset, end_offset in eq_batches:
       batch_dir = eq_output_base / batch_name
       batch_dir.mkdir(parents=True, exist_ok=True)
       output_file = batch_dir / f"event_{event_id}_raw.mseed"
 
-      if output_file.exists():
-        continue
+      if not output_file.exists():
+        starttime = event_time + start_offset
+        endtime = event_time + end_offset
+        bulk_query.extend([
+            (net, sta, loc, chan, starttime, endtime)
+            for net, sta, loc, chan in station_queries
+        ])
+        tasks_to_slice.append((batch_name, starttime, endtime, output_file))
 
-      starttime = event_time + start_offset
-      endtime = event_time + end_offset
-
-      bulk_query = [
-          (net, sta, loc, chan, starttime, endtime)
-          for net, sta, loc, chan in station_queries
-      ]
-
-      st = client.get_waveforms_bulk(bulk_query)
-      st.write(str(output_file), format="MSEED")
-      results.append(
-          f"[success] [EQ-{batch_name}] Saved event {event_id} ({len(st)} traces)"
-      )
-
-    # PROCESS NOISE BATCHES
+    # --- PREPARE NOISE BATCHES ---
     noise_output_base = output_base_dir / "batched_noise_waveforms"
     for batch_name, start_offset, end_offset in noise_batches:
       batch_dir = noise_output_base / batch_name
       batch_dir.mkdir(parents=True, exist_ok=True)
       output_file = batch_dir / f"noise_event_{event_id}_raw.mseed"
 
-      if output_file.exists():
-        continue
+      if not output_file.exists():
+        starttime = event_time + start_offset
+        endtime = event_time + end_offset
 
-      starttime = event_time + start_offset
-      endtime = event_time + end_offset
+        # Contamination check
+        buffer = 60
+        overlapping_events = df_full[
+            (df_full["ParsedUTC"] >= (starttime - buffer))
+            & (df_full["ParsedUTC"] <= (endtime + buffer))
+        ]
 
-      # Contamination check: Ensure no other catalog event occurs inside this noise window
-      buffer = 60
-      overlapping_events = df_full[
-          (df_full["ParsedUTC"] >= (starttime - buffer))
-          & (df_full["ParsedUTC"] <= (endtime + buffer))
-      ]
+        if not overlapping_events.empty:
+          results.append(
+              f"[skipped] [Noise-{batch_name}] Event {event_id} overlaps with "
+              f"{len(overlapping_events)} other event(s)."
+          )
+          continue
 
-      if not overlapping_events.empty:
-        results.append(
-            f"[skipped] [Noise-{batch_name}] Event {event_id} noise window"
-            f" overlaps with {len(overlapping_events)} other event(s)."
-        )
-        continue
+        bulk_query.extend([
+            (net, sta, loc, chan, starttime, endtime)
+            for net, sta, loc, chan in station_queries
+        ])
+        tasks_to_slice.append((batch_name, starttime, endtime, output_file))
 
-      bulk_query = [
-          (net, sta, loc, chan, starttime, endtime)
-          for net, sta, loc, chan in station_queries
-      ]
+    # If all files already exist, exit early
+    if not bulk_query:
+      return f"[skip] All files already exist for {event_id}"
 
-      st = client.get_waveforms_bulk(bulk_query)
-      st.write(str(output_file), format="MSEED")
-      results.append(
-          f"[success] [Noise-{batch_name}] Saved clean noise for {event_id}"
-          f" ({len(st)} traces)"
-      )
+    # OPTIMIZATION 2: Single consolidated network request for ALL windows
+    try:
+        st_master = client.get_waveforms_bulk(bulk_query)
+    except Exception as e:
+        return f"[warning] No data returned for {event_id}: {e}"
+
+    # SLICE AND SAVE IN RAM
+    for batch_name, starttime, endtime, output_file in tasks_to_slice:
+        # ObsPy safely extracts just the exact timeframe needed for this batch
+        st_sliced = st_master.slice(starttime, endtime)
+        if len(st_sliced) > 0:
+            st_sliced.write(str(output_file), format="MSEED")
+            results.append(f"[success] [{batch_name}] Saved {event_id} ({len(st_sliced)} traces)")
+        else:
+            results.append(f"[warning] [{batch_name}] No traces matching window for {event_id}")
 
     return "\n".join(results)
 
@@ -164,6 +185,7 @@ def download_all_concurrent(
   else:
     df_process = df
 
+  # Notice: The client instantiation here is passed into the worker.
   client = Client(FDSN_CLIENT)
 
   # Execute downloads concurrently per event

@@ -93,7 +93,7 @@ def window_array(data: np.ndarray, fs: float = 100.0, window_seconds: float = 60
     return windows
 
 
-# PRE-SCAN
+# PRE-SCAN LOGIC
 
 def scan_single_mseed(args: Tuple[Path, float, float, float]) -> Tuple[Path, int]:
     """Reads ONLY the headers of an mseed file to count extractable valid windows."""
@@ -126,7 +126,7 @@ def scan_single_mseed(args: Tuple[Path, float, float, float]) -> Tuple[Path, int
     return file_path, total_windows_in_file
 
 
-# PROCESSING
+# PROCESSING LOGIC
 
 def mseed_file_to_ram_rgb(file_path: Path, out_dir: Path, file_id: str, d: int, fs: float, window_seconds: float, overlap: float):
     st = read(str(file_path))
@@ -176,127 +176,158 @@ def _process_task(args):
         return f"[WARN] Failed file {file_id}: {e}"
 
 
-def run_preprocessing_mseed(
-    data_dir: str, 
+# ORCHESTRATION 
+
+def allocate_files(valid_files_with_counts: list, target_total: int, split_ratios: tuple) -> tuple:
+    """Helper function to cleanly split files into Train/Val/Test based on a strict total target."""
+    random.shuffle(valid_files_with_counts)
+
+    target_train = int(target_total * split_ratios[0])
+    target_val = int(target_total * split_ratios[1])
+    target_test = target_total - target_train - target_val 
+
+    train_files, val_files, test_files = [], [], []
+    c_train = c_val = c_test = 0
+
+    for fpath, w_count in valid_files_with_counts:
+        if target_train > 0 and c_train < target_train:
+            train_files.append(fpath)
+            c_train += w_count
+        elif target_val > 0 and c_val < target_val:
+            val_files.append(fpath)
+            c_val += w_count
+        elif target_test > 0 and c_test < target_test:
+            test_files.append(fpath)
+            c_test += w_count
+        else:
+            if c_train >= target_train and c_val >= target_val and c_test >= target_test:
+                break
+                
+    return (train_files, val_files, test_files), (c_train, c_val, c_test), (target_train, target_val, target_test)
+
+
+def run_balanced_preprocessing(
+    eq_dir: str, 
+    noise_dir: str, 
     output_dir: str, 
-    class_name: str, 
     split_ratios: tuple = (0.70, 0.15, 0.15),
     d: int = 64, 
     fs: float = 100.0,
     window_seconds: float = 60.0,
     overlap: float = 0.5,
-    limit_pictures: int = 140000
+    limit_pictures: int = None
 ):
-    train_dir = Path(output_dir) / "train" / class_name
-    val_dir = Path(output_dir) / "val" / class_name
-    test_dir = Path(output_dir) / "test" / class_name
-
-    train_dir.mkdir(parents=True, exist_ok=True)
-    val_dir.mkdir(parents=True, exist_ok=True)
-    test_dir.mkdir(parents=True, exist_ok=True)
-
-    source_path = Path(data_dir)
-    if not source_path.exists():
-        print(f"[{class_name.upper()}] Directory not found: {source_path}. Skipping...")
-        return
-
-    mseed_files = list(source_path.rglob("*.mseed"))
-    if not mseed_files:
-        print(f"[{class_name.upper()}] No .mseed files found under {source_path}.")
-        return
+    print("="*60)
+    print("STARTING DATASET GENERATION")
+    print("="*60)
+    
+    # Setup Directories
+    classes = [("01_earthquake", Path(eq_dir)), ("00_noise", Path(noise_dir))]
+    out_paths = {}
+    
+    for class_name, _ in classes:
+        out_paths[class_name] = {}
+        for split in ["train", "val", "test"]:
+            split_dir = Path(output_dir) / split / class_name
+            split_dir.mkdir(parents=True, exist_ok=True)
+            out_paths[class_name][split] = split_dir
 
     num_cores = max(1, multiprocessing.cpu_count() - 1)
     
-    # --- 1. SCAN PHASE ---
-    print(f"[{class_name.upper()}] Phase 1: Scanning headers of {len(mseed_files)} files to count valid windows...")
-    valid_files_with_counts = []
+    # Scan and Count Everything
+    print("\n[PHASE 1] Scanning headers to find available valid windows...")
+    class_data = {}
     
-    scan_args = [(fp, fs, window_seconds, overlap) for fp in mseed_files]
+    for class_name, source_path in classes:
+        if not source_path.exists():
+            raise FileNotFoundError(f"Input directory not found: {source_path}")
+            
+        mseed_files = list(source_path.rglob("*.mseed"))
+        scan_args = [(fp, fs, window_seconds, overlap) for fp in mseed_files]
+        
+        valid_files = []
+        total_windows = 0
+        
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores) as executor:
+            for file_path, w_count in executor.map(scan_single_mseed, scan_args):
+                if w_count > 0:
+                    valid_files.append((file_path, w_count))
+                    total_windows += w_count
+                    
+        class_data[class_name] = {
+            "valid_files": valid_files,
+            "total_windows": total_windows
+        }
+        print(f"  -> {class_name.upper()}: Found {total_windows} extractable windows across {len(valid_files)} files.")
+
+    # Balance the Targets
+    print("\n[PHASE 2] Balancing classes...")
+    eq_total = class_data["01_earthquake"]["total_windows"]
+    noise_total = class_data["00_noise"]["total_windows"]
     
-    with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores) as executor:
-        for file_path, w_count in executor.map(scan_single_mseed, scan_args):
-            if w_count > 0:
-                valid_files_with_counts.append((file_path, w_count))
-                
-    if not valid_files_with_counts:
-        print(f"[{class_name.upper()}] No valid files with sufficient length/channels found.")
+    if eq_total == 0 or noise_total == 0:
+        print("[ERROR] One of the classes has 0 valid windows. Aborting.")
         return
 
-    #  SPLIT PHASE
-    print(f"[{class_name.upper()}] Phase 2: Allocating {len(valid_files_with_counts)} valid files...")
+    # Find the maximum possible balanced dataset size (the bottleneck)
+    bottleneck_size = min(eq_total, noise_total)
     
-    random.seed(42)
-    random.shuffle(valid_files_with_counts)
-
-    # Determine the actual number of windows available in the dataset
-    total_available_windows = sum(count for _, count in valid_files_with_counts)
-    
-    # Base our targets on the lesser of your hard limit OR the actual available data
-    if limit_pictures and limit_pictures < total_available_windows:
-        effective_total = limit_pictures
+    # Apply limit_pictures if it exists (divided by 2 because it's the TOTAL dataset size desired)
+    if limit_pictures:
+        target_per_class = min(bottleneck_size, limit_pictures // 2)
     else:
-        effective_total = total_available_windows
+        target_per_class = bottleneck_size
+        
+    print(f"  -> Bottleneck dictates a maximum of {bottleneck_size} images per class.")
+    print(f"  -> Final target set to {target_per_class} images per class (Total: {target_per_class * 2} images).")
 
-    # Calculate exact targets based on the effective total and requested ratios
-    target_train = int(effective_total * split_ratios[0])
-    target_val = int(effective_total * split_ratios[1])
-    target_test = effective_total - target_train - target_val  # absorbs any rounding errors
-
-    train_files, val_files, test_files = [], [], []
-    count_train = count_val = count_test = 0
-
-    for fpath, w_count in valid_files_with_counts:
-        # Check against target limits. If a split ratio is 0, its target is 0,
-        # so this condition fails immediately and cleanly skips the block.
-        if target_train > 0 and count_train < target_train:
-            train_files.append(fpath)
-            count_train += w_count
-        elif target_val > 0 and count_val < target_val:
-            val_files.append(fpath)
-            count_val += w_count
-        elif target_test > 0 and count_test < target_test:
-            test_files.append(fpath)
-            count_test += w_count
-        else:
-            # Breaks early if limit_pictures threshold is successfully reached
-            break
-
-    print(f"[{class_name.upper()}] Target Windows -> Train: {target_train} | Val: {target_val} | Test: {target_test}")
-    print(f"[{class_name.upper()}] Actual Windows -> Train: {count_train} | Val: {count_val} | Test: {count_test}")
-    print(f"[{class_name.upper()}] Files Used     -> Train: {len(train_files)} | Val: {len(val_files)} | Test: {len(test_files)}\n")
-
-    # PROCESS PHASE
-    print(f"[{class_name.upper()}] Phase 3: Extracting and converting {count_train + count_val + count_test} total windows...")
+    # Allocate Splits Safely
+    print("\n[PHASE 3] Allocating splits...")
+    tasks = []
     
-    def task_generator():
-        for fpath in train_files:
-            yield (fpath, train_dir, fpath.stem, d, fs, window_seconds, overlap)
-        for fpath in val_files:
-            yield (fpath, val_dir, fpath.stem, d, fs, window_seconds, overlap)
-        for fpath in test_files:
-            yield (fpath, test_dir, fpath.stem, d, fs, window_seconds, overlap)
+    for class_name, _ in classes:
+        file_lists, actual_counts, target_counts = allocate_files(
+            class_data[class_name]["valid_files"], 
+            target_per_class, 
+            split_ratios
+        )
+        
+        train_f, val_f, test_f = file_lists
+        print(f"  -> {class_name.upper()}:")
+        print(f"     Target | Train: {target_counts[0]:<6} | Val: {target_counts[1]:<6} | Test: {target_counts[2]:<6}")
+        print(f"     Actual | Train: {actual_counts[0]:<6} | Val: {actual_counts[1]:<6} | Test: {actual_counts[2]:<6}")
 
+        # Build execution tasks
+        for fpath in train_f:
+            tasks.append((fpath, out_paths[class_name]["train"], fpath.stem, d, fs, window_seconds, overlap))
+        for fpath in val_f:
+            tasks.append((fpath, out_paths[class_name]["val"], fpath.stem, d, fs, window_seconds, overlap))
+        for fpath in test_f:
+            tasks.append((fpath, out_paths[class_name]["test"], fpath.stem, d, fs, window_seconds, overlap))
+
+    # Generate Data
+    print(f"\n[PHASE 4] Processing {len(tasks)} file generation tasks on {num_cores} cores...")
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores) as executor:
-        for error_msg in executor.map(_process_task, task_generator()):
+        for error_msg in executor.map(_process_task, tasks):
             if error_msg:
                 print(error_msg)
                 
-    print(f"[{class_name.upper()}] Processing complete!\n")
+    print("\n[COMPLETE] Balanced dataset generation finished successfully!")
+
 
 if __name__ == "__main__":
-    datasets_to_process = [
-        {"path": "data/batched_waveforms", "class_name": "01_earthquake"},
-        {"path": "data/batched_noise_waveforms", "class_name": "00_noise"}
-    ]
-
-    for dataset in datasets_to_process:
-        run_preprocessing_mseed(
-            data_dir=dataset["path"],      
-            output_dir="dataset",       
-            class_name=dataset["class_name"],
-            split_ratios=(0, 0, 1.0), 
-            d=64,
-            fs=100.0,                  
-            window_seconds=60.0,       
-            overlap=0.50,
-        )
+    
+    EQ_BATCH_DIR = "data/batched_waveforms/window_extended"
+    NOISE_BATCH_DIR = "data/batched_noise_waveforms/noise_pre_3h"
+    
+    run_balanced_preprocessing(
+        eq_dir=EQ_BATCH_DIR,      
+        noise_dir=NOISE_BATCH_DIR,       
+        output_dir="dataset",       
+        split_ratios=(0.70, 0.15, 0.15), 
+        d=32,
+        fs=100.0,                  
+        window_seconds=60.0,       
+        overlap=0.50,
+        limit_pictures=None, 
+    )
