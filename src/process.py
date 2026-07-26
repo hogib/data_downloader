@@ -88,6 +88,8 @@ def window_array(data: np.ndarray, fs: float = 100.0, window_seconds: float = 60
         start_idx = i * step_samples
         end_idx = start_idx + target_samples
         win = data[start_idx:end_idx, :]
+        if len(win) != target_samples:
+                continue
         if len(win) == target_samples:
             windows.append(win)
     return windows
@@ -317,17 +319,17 @@ def run_balanced_preprocessing(
 
 if __name__ == "__main__":
     
-    EQ_BATCH_DIR = "data/batched_waveforms/window_extended"
-    NOISE_BATCH_DIR = "data/batched_noise_waveforms/noise_pre_3h"
+    EQ_BATCH_DIR = "data/batched_waveforms/window_post_200s"
+    NOISE_BATCH_DIR = "data/batched_noise_waveforms"
     
     run_balanced_preprocessing(
         eq_dir=EQ_BATCH_DIR,      
         noise_dir=NOISE_BATCH_DIR,       
-        output_dir="dataset",       
+        output_dir="dataset_60s",       
         split_ratios=(0.70, 0.15, 0.15), 
-        d=32,
+        d=24,
         fs=100.0,                  
-        window_seconds=60.0,       
+        window_seconds=200.0,       
         overlap=0.50,
-        limit_pictures=None, 
+        # limit_pictures=10000, 
     )

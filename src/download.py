@@ -10,7 +10,7 @@ from obspy.clients.fdsn import Client
 EARTHQUAKE_BATCHES = [
     ("window_pre_200s", -200, 0),
     ("window_post_60s", 0, 60),
-    ("window_extended", -30, 300),
+    ("window_post_120s", 0, 120),
     ("window_post_200s", 0, 200),
 ]
 

@@ -76,7 +76,7 @@ def remove_wrong_sized_images(dataset_dir: str, auto_delete: bool = False):
 
 
 if __name__ == "__main__":
-    DATASET_DIRECTORY = "dataset"
+    DATASET_DIRECTORY = "dataset_60s"
     
     remove_wrong_sized_images(
         dataset_dir=DATASET_DIRECTORY, 
