@@ -3,6 +3,7 @@ import math
 import multiprocessing
 import os
 import random
+import re
 from pathlib import Path
 from typing import List, Tuple
 
@@ -11,7 +12,9 @@ import scipy.signal as signal
 from obspy import read
 from PIL import Image
 
+# ==========================================
 # ALGORITHM FUNCTIONS
+# ==========================================
 
 def standardize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     x = np.asarray(x, dtype=np.float64)
@@ -20,6 +23,7 @@ def standardize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     if sigma < eps:
         sigma = eps
     return (x - mu) / sigma
+
 
 def reshape_to_d_by_n(x: np.ndarray, d: int) -> np.ndarray:
     m = len(x)
@@ -31,6 +35,7 @@ def reshape_to_d_by_n(x: np.ndarray, d: int) -> np.ndarray:
             idx = (base + row) % m
             M[row, col] = x[idx]
     return M
+
 
 def ram_matrix(x: np.ndarray, d: int, eps: float = 1e-12) -> np.ndarray:
     x_std = standardize(x, eps=eps)
@@ -52,6 +57,7 @@ def ram_matrix(x: np.ndarray, d: int, eps: float = 1e-12) -> np.ndarray:
         betas[i] = np.arccos(cos_val)
     return betas[None, :] - betas[:, None]
 
+
 def to_uint8(mat: np.ndarray) -> np.ndarray:
     mat = np.asarray(mat, dtype=np.float64)
     mn, mx = np.min(mat), np.max(mat)
@@ -59,6 +65,7 @@ def to_uint8(mat: np.ndarray) -> np.ndarray:
         return np.zeros(mat.shape, dtype=np.uint8)
     out = (mat - mn) / (mx - mn)
     return (out * 255.0).round().astype(np.uint8)
+
 
 def clean_and_filter_1d(x: np.ndarray, fs: float, freqmin: float, freqmax: float) -> np.ndarray:
     x = signal.detrend(x, type='linear')
@@ -74,38 +81,58 @@ def clean_and_filter_1d(x: np.ndarray, fs: float, freqmin: float, freqmax: float
         x = signal.filtfilt(b, a, x)
     return x
 
+
 def window_array(data: np.ndarray, fs: float = 100.0, window_seconds: float = 60.0, overlap: float = 0.5) -> List[np.ndarray]:
     target_samples = int(fs * window_seconds)
     step_samples = int(target_samples * (1.0 - overlap))
     if step_samples < 1:
         raise ValueError("Overlap fraction too high; step size must be at least 1 sample.")
+        
     n_samples = data.shape[0]
     windows = []
-    if n_samples < target_samples:
+    
+    # 5% tolerance to prevent dropping slightly truncated batched files
+    tolerance = int(target_samples * 0.05) 
+    
+    if n_samples < (target_samples - tolerance):
         return windows
+        
     n_windows = math.ceil((n_samples - target_samples) / step_samples) + 1
     for i in range(n_windows):
         start_idx = i * step_samples
         end_idx = start_idx + target_samples
         win = data[start_idx:end_idx, :]
-        if len(win) != target_samples:
-                continue
-        if len(win) == target_samples:
+        
+        # If the window falls within tolerance but is slightly short
+        if len(win) >= (target_samples - tolerance):
+            
+            # Pad with zeros if it doesn't perfectly match target_samples
+            if len(win) < target_samples:
+                pad_length = target_samples - len(win)
+                # Pad only the time axis (0), leave the channel axis (1) alone
+                win = np.pad(win, ((0, pad_length), (0, 0)), mode='constant', constant_values=0)
+                
             windows.append(win)
+            
     return windows
 
 
+# ==========================================
 # PRE-SCAN LOGIC
+# ==========================================
 
 def scan_single_mseed(args: Tuple[Path, float, float, float]) -> Tuple[Path, int]:
-    """Reads ONLY the headers of an mseed file to count extractable valid windows."""
-    file_path, fs, window_seconds, overlap = args
+    file_path, nominal_fs, window_seconds, overlap = args
     try:
         st = read(str(file_path), headonly=True)
-    except Exception:
+    except Exception as e:
+        print(f"\n[ERROR] Obspy failed to read {file_path.name}: {e}")
         return file_path, 0
 
-    target_samples = int(fs * window_seconds)
+    # Dynamically grab the file's true sampling rate
+    actual_fs = st[0].stats.sampling_rate 
+    target_samples = int(actual_fs * window_seconds)
+    tolerance_samples = int(target_samples * 0.05)
     step_samples = int(target_samples * (1.0 - overlap))
     
     stations = {}
@@ -114,32 +141,51 @@ def scan_single_mseed(args: Tuple[Path, float, float, float]) -> Tuple[Path, int
         chan = tr.stats.channel[-1].upper()
         if sta_key not in stations:
             stations[sta_key] = {}
-        stations[sta_key][chan] = tr.stats.npts
+        
+        # Keep the maximum length trace so fragments don't overwrite it
+        current_len = stations[sta_key].get(chan, 0)
+        stations[sta_key][chan] = max(current_len, tr.stats.npts)
         
     total_windows_in_file = 0
     for sta_key, channels in stations.items():
         available_chans = sorted(channels.keys())
+        
         if len(available_chans) >= 3:
             min_len = min(channels[ch] for ch in available_chans[:3])
-            if min_len >= target_samples:
-                n_win = ((min_len - target_samples) // step_samples) + 1
-                total_windows_in_file += n_win
-                
+            
+            if min_len >= (target_samples - tolerance_samples):
+                n_win = ((min_len - target_samples + tolerance_samples) // step_samples) + 1
+                if n_win > 0:
+                    total_windows_in_file += n_win
+                    
     return file_path, total_windows_in_file
 
 
+# ==========================================
 # PROCESSING LOGIC
+# ==========================================
 
-def mseed_file_to_ram_rgb(file_path: Path, out_dir: Path, file_id: str, d: int, fs: float, window_seconds: float, overlap: float):
+def mseed_file_to_ram_rgb(file_path: Path, out_dir: Path, file_id: str, d: int, nominal_fs: float, window_seconds: float, overlap: float):
     st = read(str(file_path))
+    try:
+        st.merge(method=1, fill_value='interpolate')
+    except Exception as e:
+        print(f"[WARN] Failed to merge traces in {file_path.name}: {e}")
+        return
+        
+    actual_fs = st[0].stats.sampling_rate
+    
     stations = {}
     for tr in st:
         sta_key = f"{tr.stats.network}.{tr.stats.station}"
         if sta_key not in stations:
             stations[sta_key] = {}
         chan = tr.stats.channel[-1].upper()
+        # It is now safe to overwrite because merge() consolidated them into 1 trace per channel
         stations[sta_key][chan] = tr.data.astype(np.float64)
 
+    target_samples = int(actual_fs * window_seconds)
+    tolerance_samples = int(target_samples * 0.05)
     for sta_key, channels in stations.items():
         available_chans = sorted(channels.keys())
         if len(available_chans) < 3:
@@ -148,7 +194,8 @@ def mseed_file_to_ram_rgb(file_path: Path, out_dir: Path, file_id: str, d: int, 
         raw_channels = [channels[ch] for ch in available_chans[:3]]
         min_len = min(len(ch) for ch in raw_channels)
         
-        if min_len < int(fs * window_seconds):
+        # Apply tolerance check
+        if min_len < (target_samples - tolerance_samples):
             continue  
             
         trimmed_channels = [ch[:min_len] for ch in raw_channels]
@@ -156,9 +203,10 @@ def mseed_file_to_ram_rgb(file_path: Path, out_dir: Path, file_id: str, d: int, 
 
         cleaned_data = np.zeros_like(event_data, dtype=np.float64)
         for i in range(event_data.shape[1]):
-            cleaned_data[:, i] = clean_and_filter_1d(event_data[:, i], fs, 1.0, 45.0)
+            cleaned_data[:, i] = clean_and_filter_1d(event_data[:, i], actual_fs, 1.0, 45.0)
 
-        windows = window_array(cleaned_data, fs=fs, window_seconds=window_seconds, overlap=overlap)
+        # Pass actual_fs down to window_array
+        windows = window_array(cleaned_data, fs=actual_fs, window_seconds=window_seconds, overlap=overlap)
 
         for w_idx, win in enumerate(windows):
             ram_B = to_uint8(ram_matrix(win[:, 0], d=d)) 
@@ -169,6 +217,7 @@ def mseed_file_to_ram_rgb(file_path: Path, out_dir: Path, file_id: str, d: int, 
             img = Image.fromarray(rgb, mode="RGB")
             img.save(out_dir / f"{file_id}_{sta_key}_win{w_idx:03d}.png")
 
+
 def _process_task(args):
     file_path, out_dir, file_id, d, fs, window_seconds, overlap = args
     try:
@@ -178,7 +227,9 @@ def _process_task(args):
         return f"[WARN] Failed file {file_id}: {e}"
 
 
+# ==========================================
 # ORCHESTRATION 
+# ==========================================
 
 def allocate_files(valid_files_with_counts: list, target_total: int, split_ratios: tuple) -> tuple:
     """Helper function to cleanly split files into Train/Val/Test based on a strict total target."""
@@ -242,7 +293,9 @@ def run_balanced_preprocessing(
     
     for class_name, source_path in classes:
         if not source_path.exists():
-            raise FileNotFoundError(f"Input directory not found: {source_path}")
+            print(f"[WARN] Input directory not found: {source_path}. Skipping.")
+            class_data[class_name] = {"valid_files": [], "total_windows": 0}
+            continue
             
         mseed_files = list(source_path.rglob("*.mseed"))
         scan_args = [(fp, fs, window_seconds, overlap) for fp in mseed_files]
@@ -268,7 +321,7 @@ def run_balanced_preprocessing(
     noise_total = class_data["00_noise"]["total_windows"]
     
     if eq_total == 0 or noise_total == 0:
-        print("[ERROR] One of the classes has 0 valid windows. Aborting.")
+        print("[ERROR] One of the classes has 0 valid windows. Aborting this folder.")
         return
 
     # Find the maximum possible balanced dataset size (the bottleneck)
@@ -317,19 +370,51 @@ def run_balanced_preprocessing(
     print("\n[COMPLETE] Balanced dataset generation finished successfully!")
 
 
+# ==========================================
+# MAIN WRAPPER 
+# ==========================================
+
 if __name__ == "__main__":
     
-    EQ_BATCH_DIR = "data/batched_waveforms/window_post_200s"
+    BASE_WAVEFORMS_DIR = Path("data/batched_waveforms")
     NOISE_BATCH_DIR = "data/batched_noise_waveforms"
     
-    run_balanced_preprocessing(
-        eq_dir=EQ_BATCH_DIR,      
-        noise_dir=NOISE_BATCH_DIR,       
-        output_dir="dataset_60s",       
-        split_ratios=(0.70, 0.15, 0.15), 
-        d=24,
-        fs=100.0,                  
-        window_seconds=200.0,       
-        overlap=0.50,
-        # limit_pictures=10000, 
-    )
+    target_directories = [
+        "window_post_60s",
+        "window_post_100s",
+        "window_post_120s",
+        "window_post_200s",
+        "window_pre_100s",
+        "window_pre_200s"
+    ]
+    
+    for dir_name in target_directories:
+        match = re.search(r'(\d+)s$', dir_name)
+        if not match:
+            print(f"[WARN] Could not parse window seconds from {dir_name}. Skipping...")
+            continue
+            
+        nominal_window_secs = float(match.group(1))
+        eq_dir = BASE_WAVEFORMS_DIR / dir_name
+        
+        if not eq_dir.exists():
+            print(f"[WARN] Directory {eq_dir} does not exist. Skipping...")
+            continue
+
+        output_dir = f"dataset_{dir_name}"
+        
+        print(f"\n{'#'*60}")
+        print(f"RUNNING PIPELINE FOR: {dir_name} (Window Size: {nominal_window_secs}s)")
+        print(f"{'#'*60}\n")
+        
+        run_balanced_preprocessing(
+            eq_dir=str(eq_dir),      
+            noise_dir=NOISE_BATCH_DIR,       
+            output_dir=output_dir,        
+            split_ratios=(0.70, 0.15, 0.15), 
+            d=24,
+            fs=100.0, 
+            window_seconds=nominal_window_secs,        
+            overlap=0.50,
+            # limit_pictures=10000, 
+        )

@@ -12,6 +12,8 @@ EARTHQUAKE_BATCHES = [
     ("window_post_60s", 0, 60),
     ("window_post_120s", 0, 120),
     ("window_post_200s", 0, 200),
+    ("window_post_100s", 0, 100),
+    ("window_pre_100s", -100, 0),
 ]
 
 # Noise waveform windows: (window_name, start_offset_sec, end_offset_sec)
