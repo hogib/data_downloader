@@ -47,10 +47,10 @@ def main():
             noise_dir=noise_batch_dir,       
             output_dir=output_dir,        
             split_ratios=(0.70, 0.15, 0.15), 
-            d=24,
+            d=100,
             fs=100.0,                  
             window_seconds=actual_window_secs,        
-            overlap=0.50,
+            overlap=0.25,
         )
 
 if __name__ == "__main__":

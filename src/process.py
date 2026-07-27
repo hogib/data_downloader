@@ -27,14 +27,17 @@ def standardize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 
 def reshape_to_d_by_n(x: np.ndarray, d: int) -> np.ndarray:
     m = len(x)
-    n = int(np.ceil(m / d))
-    M = np.empty((d, n), dtype=np.float64)
-    for col in range(n):
-        base = col * d
-        for row in range(d):
-            idx = (base + row) % m
-            M[row, col] = x[idx]
-    return M
+    # Calculate how much padding is needed to make m perfectly divisible by d
+    pad_len = (d - (m % d)) % d
+    
+    if pad_len > 0:
+        # Pad the end with zeros to avoid wraparound artifacts
+        x = np.pad(x, (0, pad_len), mode='constant', constant_values=0)
+        
+    n = len(x) // d
+    
+    # Reshape is infinitely faster than a double nested for-loop
+    return x.reshape((n, d)).T
 
 
 def ram_matrix(x: np.ndarray, d: int, eps: float = 1e-12) -> np.ndarray:
@@ -60,10 +63,13 @@ def ram_matrix(x: np.ndarray, d: int, eps: float = 1e-12) -> np.ndarray:
 
 def to_uint8(mat: np.ndarray) -> np.ndarray:
     mat = np.asarray(mat, dtype=np.float64)
-    mn, mx = np.min(mat), np.max(mat)
-    if np.isclose(mx, mn):
-        return np.zeros(mat.shape, dtype=np.uint8)
-    out = (mat - mn) / (mx - mn)
+    # The matrix contains angle differences. Use a fixed global scale [-pi, pi] 
+    # instead of dynamic min-max, which destroys relative intensity.
+    mat_clipped = np.clip(mat, -np.pi, np.pi)
+    
+    # Normalize to [0, 1] based on the fixed theoretical bounds
+    out = (mat_clipped + np.pi) / (2 * np.pi)
+    
     return (out * 255.0).round().astype(np.uint8)
 
 
