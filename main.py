@@ -11,11 +11,13 @@ def main():
     
     target_directories = [
         "window_post_60s",
-        "window_post_100s",
-        "window_post_120s",
-        "window_post_200s",
-        "window_pre_100s",
-        "window_pre_200s"
+        "window_post_3s"
+        "window_post_6s"
+        # "window_post_100s",
+        # "window_post_120s",
+        # "window_post_200s",
+        # "window_pre_100s",
+        # "window_pre_200s"
     ]
     
     for dir_name in target_directories:
