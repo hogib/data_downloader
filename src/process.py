@@ -187,11 +187,11 @@ def mseed_file_to_ram_rgb(file_path: Path, out_dir: Path, file_id: str, d: int, 
         if sta_key not in stations:
             stations[sta_key] = {}
         chan = tr.stats.channel[-1].upper()
-        # It is now safe to overwrite because merge() consolidated them into 1 trace per channel
         stations[sta_key][chan] = tr.data.astype(np.float64)
 
     target_samples = int(actual_fs * window_seconds)
     tolerance_samples = int(target_samples * 0.05)
+    
     for sta_key, channels in stations.items():
         available_chans = sorted(channels.keys())
         if len(available_chans) < 3:
@@ -200,25 +200,28 @@ def mseed_file_to_ram_rgb(file_path: Path, out_dir: Path, file_id: str, d: int, 
         raw_channels = [channels[ch] for ch in available_chans[:3]]
         min_len = min(len(ch) for ch in raw_channels)
         
-        # Apply tolerance check
         if min_len < (target_samples - tolerance_samples):
             continue  
             
         trimmed_channels = [ch[:min_len] for ch in raw_channels]
         event_data = np.column_stack(trimmed_channels)
 
-        cleaned_data = np.zeros_like(event_data, dtype=np.float64)
-        for i in range(event_data.shape[1]):
-            cleaned_data[:, i] = clean_and_filter_1d(event_data[:, i], actual_fs, 1.0, 45.0)
-
-        # Pass actual_fs down to window_array
-        windows = window_array(cleaned_data, fs=actual_fs, window_seconds=window_seconds, overlap=overlap)
+        
+        windows = window_array(event_data, fs=actual_fs, window_seconds=window_seconds, overlap=overlap)
 
         for w_idx, win in enumerate(windows):
-            ram_B = to_uint8(ram_matrix(win[:, 0], d=d)) 
-            ram_G = to_uint8(ram_matrix(win[:, 1], d=d)) 
-            ram_R = to_uint8(ram_matrix(win[:, 2], d=d)) 
             
+            # Apply the detrend and taper strictly inside the window's scope
+            cleaned_win = np.zeros_like(win, dtype=np.float64)
+            for i in range(win.shape[1]):
+                cleaned_win[:, i] = clean_and_filter_1d(win[:, i], actual_fs, 1.0, 45.0)
+
+            # Generate the RAM matrices using the safely tapered window
+            ram_B = to_uint8(ram_matrix(cleaned_win[:, 0], d=d)) 
+            ram_G = to_uint8(ram_matrix(cleaned_win[:, 1], d=d)) 
+            ram_R = to_uint8(ram_matrix(cleaned_win[:, 2], d=d)) 
+            
+            # Save the image
             rgb = np.stack([ram_R, ram_G, ram_B], axis=-1)
             img = Image.fromarray(rgb, mode="RGB")
             img.save(out_dir / f"{file_id}_{sta_key}_win{w_idx:03d}.png")

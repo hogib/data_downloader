@@ -129,7 +129,7 @@ def mseed_file_to_spectrogram_tensor(file_path: Path, out_dir: Path, file_id: st
     # Initialize torchaudio transforms once per file
     spectrogram_transform = T.Spectrogram(
         n_fft=n_fft, 
-        hop_length=n_fft // 4,  # Standard 75% overlap for spectrogram bins
+        hop_length=n_fft // 4,
         power=2.0
     )
     db_transform = T.AmplitudeToDB()
@@ -148,20 +148,25 @@ def mseed_file_to_spectrogram_tensor(file_path: Path, out_dir: Path, file_id: st
         trimmed_channels = [ch[:min_len] for ch in raw_channels]
         event_data = np.column_stack(trimmed_channels)
 
-        cleaned_data = np.zeros_like(event_data, dtype=np.float64)
-        for i in range(event_data.shape[1]):
-            cleaned_data[:, i] = clean_and_filter_1d(event_data[:, i], actual_fs, 1.0, 45.0)
+        
+        # Chop the raw data into windows
+        windows = window_array(event_data, fs=actual_fs, window_seconds=window_seconds, overlap=overlap)
 
-        windows = window_array(cleaned_data, fs=actual_fs, window_seconds=window_seconds, overlap=overlap)
-
+        # Process each window individually
         for w_idx, win in enumerate(windows):
-            # win is shape (samples, 3). Transpose to (3, samples) for PyTorch
-            win_tensor = torch.from_numpy(win.T).float()
+            
+            # Apply the detrend and taper strictly inside the window's scope
+            cleaned_win = np.zeros_like(win, dtype=np.float64)
+            for i in range(win.shape[1]):
+                cleaned_win[:, i] = clean_and_filter_1d(win[:, i], actual_fs, 1.0, 45.0)
+            
+            # Transpose and convert to PyTorch
+            win_tensor = torch.from_numpy(cleaned_win.T).float()
             
             # Generate Spectrogram -> output shape: (3, Freq, Time)
             spec = spectrogram_transform(win_tensor)
             
-            # Convert to Decibel scale (crucial for seismic dynamic range)
+            # Convert to Decibel scale 
             spec_db = db_transform(spec)
             
             # Save directly as a PyTorch tensor
@@ -317,12 +322,12 @@ def main():
     noise_batch_dir = "data/batched_noise_waveforms"
     
     target_directories = [
-        "window_post_60s",
-        "window_post_100s",
-        "window_post_120s",
-        "window_post_200s",
+        # "window_post_60s",
+        # "window_post_100s",
+        # "window_post_120s",
+        # "window_post_200s",
         "window_pre_100s",
-        "window_pre_200s"
+        # "window_pre_200s"
     ]
     
     for dir_name in target_directories:
