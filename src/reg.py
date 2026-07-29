@@ -1,0 +1,488 @@
+import concurrent.futures
+import csv
+import math
+import multiprocessing
+import os
+import random
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import scipy.signal as signal
+from obspy import read
+from PIL import Image
+
+# ALGORITHM FUNCTIONS
+
+def standardize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    mu = np.mean(x)
+    sigma = np.std(x)
+    if sigma < eps:
+        sigma = eps
+    return (x - mu) / sigma
+
+
+def reshape_to_d_by_n(x: np.ndarray, d: int) -> np.ndarray:
+    m = len(x)
+    pad_len = (d - (m % d)) % d
+    if pad_len > 0:
+        x = np.pad(x, (0, pad_len), mode='constant', constant_values=0)
+    n = len(x) // d
+    return x.reshape((n, d)).T
+
+
+def ram_matrix(x: np.ndarray, d: int, eps: float = 1e-12) -> np.ndarray:
+    x_std = standardize(x, eps=eps)
+    M = reshape_to_d_by_n(x_std, d=d)
+    X_cols = M
+    Xbar = np.mean(X_cols, axis=1)
+    norm_Xbar = np.linalg.norm(Xbar)
+    if norm_Xbar < eps:
+        norm_Xbar = eps
+    n = X_cols.shape[1]
+    betas = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        Xi = X_cols[:, i]
+        norm_Xi = np.linalg.norm(Xi)
+        if norm_Xi < eps:
+            norm_Xi = eps
+        cos_val = np.dot(Xi, Xbar) / (norm_Xi * norm_Xbar)
+        cos_val = np.clip(cos_val, -1.0, 1.0)
+        betas[i] = np.arccos(cos_val)
+    return betas[None, :] - betas[:, None]
+
+
+def to_uint8(mat: np.ndarray) -> np.ndarray:
+    mat = np.asarray(mat, dtype=np.float64)
+    mat_clipped = np.clip(mat, -np.pi, np.pi)
+    out = (mat_clipped + np.pi) / (2 * np.pi)
+    return (out * 255.0).round().astype(np.uint8)
+
+
+def clean_and_filter_1d(x: np.ndarray, fs: float, freqmin: float, freqmax: float) -> np.ndarray:
+    x = signal.detrend(x, type='linear')
+    x = signal.detrend(x, type='constant')
+    n = len(x)
+    taper_len = int(n * 0.05)
+    if taper_len > 0:
+        window = signal.windows.hann(taper_len * 2)
+        x[:taper_len] *= window[:taper_len]
+        x[-taper_len:] *= window[-taper_len:]
+    if fs / 2 > freqmax:
+        b, a = signal.butter(4, [freqmin, freqmax], btype='bandpass', fs=fs)
+        x = signal.filtfilt(b, a, x)
+    return x
+
+
+def window_array(data: np.ndarray, fs: float = 100.0, window_seconds: float = 60.0, overlap: float = 0.5) -> List[np.ndarray]:
+    target_samples = int(fs * window_seconds)
+    step_samples = int(target_samples * (1.0 - overlap))
+    if step_samples < 1:
+        raise ValueError("Overlap fraction too high; step size must be at least 1 sample.")
+        
+    n_samples = data.shape[0]
+    windows = []
+    tolerance = int(target_samples * 0.05) 
+    
+    if n_samples < (target_samples - tolerance):
+        return windows
+        
+    n_windows = math.ceil((n_samples - target_samples) / step_samples) + 1
+    for i in range(n_windows):
+        start_idx = i * step_samples
+        end_idx = start_idx + target_samples
+        win = data[start_idx:end_idx, :]
+        
+        if len(win) >= (target_samples - tolerance):
+            if len(win) < target_samples:
+                pad_length = target_samples - len(win)
+                win = np.pad(win, ((0, pad_length), (0, 0)), mode='constant', constant_values=0)
+            windows.append(win)
+            
+    return windows
+
+# CATALOG & METADATA LOGIC
+
+def load_catalog(catalog_csv_path: Optional[str]) -> Dict[str, float]:
+    """
+    Parses the catalog CSV file and returns a dictionary mapping EventID -> Magnitude.
+    """
+    catalog = {}
+    if not catalog_csv_path or not Path(catalog_csv_path).exists():
+        print(f"[INFO] No valid catalog CSV provided or file does not exist at '{catalog_csv_path}'. Skipping catalog mapping.")
+        return catalog
+        
+    try:
+        with open(catalog_csv_path, mode='r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                event_id = str(row.get('EventID', '')).strip()
+                mag_val = row.get('Magnitude', None)
+                if event_id and mag_val is not None:
+                    try:
+                        catalog[event_id] = float(mag_val)
+                    except ValueError:
+                        continue
+        print(f"[INFO] Loaded {len(catalog)} earthquake events with magnitudes from catalog.")
+    except Exception as e:
+        print(f"[WARN] Failed to load catalog CSV: {e}")
+        
+    return catalog
+
+
+def extract_magnitude(st, file_path: Path, class_name: str, catalog: Dict[str, float]) -> Optional[float]:
+    """
+    Extracts magnitude using the CSV catalog first, with fallbacks to trace stats or filename regex.
+    """
+    if "noise" in class_name.lower():
+        return 0.0
+
+    # 1. Primary Lookup: EventID in Filename
+    filename = file_path.name
+    stem = file_path.stem
+    
+    # Check if any EventID key exists as a substring in the filename
+    for event_id, mag in catalog.items():
+        if event_id in stem or event_id in filename:
+            return mag
+
+    # 2. Secondary Lookup: SAC Headers inside MSEED
+    if hasattr(st[0].stats, 'sac') and 'mag' in st[0].stats.sac:
+        return float(st[0].stats.sac.mag)
+        
+    # 3. Fallback: Parse magnitude patterns in filename (e.g., M3.9 or mag_3.9)
+    match = re.search(r'(?:mag|M|m)[\s_]*(\d+(?:\.\d+)?)', filename)
+    if match:
+        return float(match.group(1))
+
+    return None
+
+# PRE-SCAN LOGIC
+
+def scan_single_mseed(args: Tuple[Path, float, float, float]) -> Tuple[Path, int]:
+    file_path, nominal_fs, window_seconds, overlap = args
+    try:
+        st = read(str(file_path), headonly=True)
+    except Exception as e:
+        print(f"\n[ERROR] Obspy failed to read {file_path.name}: {e}")
+        return file_path, 0
+
+    actual_fs = st[0].stats.sampling_rate 
+    target_samples = int(actual_fs * window_seconds)
+    tolerance_samples = int(target_samples * 0.05)
+    step_samples = int(target_samples * (1.0 - overlap))
+    
+    stations = {}
+    for tr in st:
+        sta_key = f"{tr.stats.network}.{tr.stats.station}"
+        chan = tr.stats.channel[-1].upper()
+        if sta_key not in stations:
+            stations[sta_key] = {}
+        
+        current_len = stations[sta_key].get(chan, 0)
+        stations[sta_key][chan] = max(current_len, tr.stats.npts)
+        
+    total_windows_in_file = 0
+    for sta_key, channels in stations.items():
+        available_chans = sorted(channels.keys())
+        
+        if len(available_chans) >= 3:
+            min_len = min(channels[ch] for ch in available_chans[:3])
+            
+            if min_len >= (target_samples - tolerance_samples):
+                n_win = ((min_len - target_samples + tolerance_samples) // step_samples) + 1
+                if n_win > 0:
+                    total_windows_in_file += n_win
+                    
+    return file_path, total_windows_in_file
+
+# PROCESSING LOGIC
+
+def mseed_file_to_ram_rgb(
+    file_path: Path, 
+    out_dir: Path, 
+    split: str, 
+    class_name: str, 
+    file_id: str, 
+    d: int, 
+    nominal_fs: float, 
+    window_seconds: float, 
+    overlap: float,
+    catalog: Dict[str, float]
+):
+    st = read(str(file_path))
+    try:
+        st.merge(method=1, fill_value='interpolate')
+    except Exception as e:
+        return f"[WARN] Failed to merge traces in {file_path.name}: {e}"
+        
+    actual_fs = st[0].stats.sampling_rate
+    magnitude = extract_magnitude(st, file_path, class_name, catalog)
+    
+    stations = {}
+    for tr in st:
+        sta_key = f"{tr.stats.network}.{tr.stats.station}"
+        if sta_key not in stations:
+            stations[sta_key] = {}
+        chan = tr.stats.channel[-1].upper()
+        stations[sta_key][chan] = tr.data.astype(np.float64)
+
+    target_samples = int(actual_fs * window_seconds)
+    tolerance_samples = int(target_samples * 0.05)
+    results = []
+    
+    for sta_key, channels in stations.items():
+        available_chans = sorted(channels.keys())
+        if len(available_chans) < 3:
+            continue  
+        
+        raw_channels = [channels[ch] for ch in available_chans[:3]]
+        min_len = min(len(ch) for ch in raw_channels)
+        
+        if min_len < (target_samples - tolerance_samples):
+            continue  
+            
+        trimmed_channels = [ch[:min_len] for ch in raw_channels]
+        event_data = np.column_stack(trimmed_channels)
+
+        windows = window_array(event_data, fs=actual_fs, window_seconds=window_seconds, overlap=overlap)
+
+        for w_idx, win in enumerate(windows):
+            cleaned_win = np.zeros_like(win, dtype=np.float64)
+            for i in range(win.shape[1]):
+                cleaned_win[:, i] = clean_and_filter_1d(win[:, i], actual_fs, 1.0, 45.0)
+
+            ram_B = to_uint8(ram_matrix(cleaned_win[:, 0], d=d)) 
+            ram_G = to_uint8(ram_matrix(cleaned_win[:, 1], d=d)) 
+            ram_R = to_uint8(ram_matrix(cleaned_win[:, 2], d=d)) 
+            
+            rgb = np.stack([ram_R, ram_G, ram_B], axis=-1)
+            img = Image.fromarray(rgb, mode="RGB")
+            
+            filename = f"{file_id}_{sta_key}_win{w_idx:03d}.png"
+            img.save(out_dir / filename)
+            
+            results.append({
+                'split': split,
+                'class': class_name,
+                'filename': filename,
+                'magnitude': magnitude if magnitude is not None else "NaN"
+            })
+            
+    return results
+
+
+def _process_task(args):
+    file_path, out_dir, split, class_name, file_id, d, fs, window_seconds, overlap, catalog = args
+    try:
+        return mseed_file_to_ram_rgb(file_path, out_dir, split, class_name, file_id, d, fs, window_seconds, overlap, catalog)
+    except Exception as e:
+        return f"[WARN] Failed file {file_id}: {e}"
+
+# ORCHESTRATION 
+
+def allocate_files(valid_files_with_counts: list, target_total: int, split_ratios: tuple) -> tuple:
+    random.shuffle(valid_files_with_counts)
+
+    target_train = int(target_total * split_ratios[0])
+    target_val = int(target_total * split_ratios[1])
+    target_test = target_total - target_train - target_val 
+
+    train_files, val_files, test_files = [], [], []
+    c_train = c_val = c_test = 0
+
+    for fpath, w_count in valid_files_with_counts:
+        if target_train > 0 and c_train < target_train:
+            train_files.append(fpath)
+            c_train += w_count
+        elif target_val > 0 and c_val < target_val:
+            val_files.append(fpath)
+            c_val += w_count
+        elif target_test > 0 and c_test < target_test:
+            test_files.append(fpath)
+            c_test += w_count
+        else:
+            if c_train >= target_train and c_val >= target_val and c_test >= target_test:
+                break
+                
+    return (train_files, val_files, test_files), (c_train, c_val, c_test), (target_train, target_val, target_test)
+
+
+def run_balanced_preprocessing(
+    eq_dir: str, 
+    noise_dir: str, 
+    output_dir: str, 
+    catalog_csv_path: Optional[str] = None,
+    split_ratios: tuple = (0.70, 0.15, 0.15),
+    d: int = 64, 
+    fs: float = 100.0,
+    window_seconds: float = 60.0,
+    overlap: float = 0.5,
+    limit_pictures: int = None
+):
+    print("="*60)
+    print("STARTING DATASET GENERATION")
+    print("="*60)
+    
+    # Load catalog lookup dictionary
+    catalog = load_catalog(catalog_csv_path)
+    
+    classes = [("01_earthquake", Path(eq_dir)), ("00_noise", Path(noise_dir))]
+    out_paths = {}
+    splits = ["train", "val", "test"]
+    
+    csv_paths = {s: Path(output_dir) / s / "labels.csv" for s in splits}
+    
+    for class_name, _ in classes:
+        out_paths[class_name] = {}
+        for split in splits:
+            split_dir = Path(output_dir) / split / class_name
+            split_dir.mkdir(parents=True, exist_ok=True)
+            out_paths[class_name][split] = split_dir
+            
+    for split in splits:
+        with open(csv_paths[split], 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['filename', 'class', 'magnitude'])
+
+    num_cores = max(1, multiprocessing.cpu_count() - 1)
+    
+    print("\n[PHASE 1] Scanning headers to find available valid windows...")
+    class_data = {}
+    
+    for class_name, source_path in classes:
+        if not source_path.exists():
+            print(f"[WARN] Input directory not found: {source_path}. Skipping.")
+            class_data[class_name] = {"valid_files": [], "total_windows": 0}
+            continue
+            
+        mseed_files = list(source_path.rglob("*.mseed"))
+        scan_args = [(fp, fs, window_seconds, overlap) for fp in mseed_files]
+        
+        valid_files = []
+        total_windows = 0
+        
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores) as executor:
+            for file_path, w_count in executor.map(scan_single_mseed, scan_args):
+                if w_count > 0:
+                    valid_files.append((file_path, w_count))
+                    total_windows += w_count
+                    
+        class_data[class_name] = {
+            "valid_files": valid_files,
+            "total_windows": total_windows
+        }
+        print(f"  -> {class_name.upper()}: Found {total_windows} extractable windows across {len(valid_files)} files.")
+
+    print("\n[PHASE 2] Balancing classes...")
+    eq_total = class_data["01_earthquake"]["total_windows"]
+    noise_total = class_data["00_noise"]["total_windows"]
+    
+    if eq_total == 0 or noise_total == 0:
+        print("[ERROR] One of the classes has 0 valid windows. Aborting this folder.")
+        return
+
+    bottleneck_size = min(eq_total, noise_total)
+    
+    if limit_pictures:
+        target_per_class = min(bottleneck_size, limit_pictures // 2)
+    else:
+        target_per_class = bottleneck_size
+        
+    print(f"  -> Bottleneck dictates a maximum of {bottleneck_size} images per class.")
+    print(f"  -> Final target set to {target_per_class} images per class (Total: {target_per_class * 2} images).")
+
+    print("\n[PHASE 3] Allocating splits...")
+    tasks = []
+    
+    for class_name, _ in classes:
+        file_lists, actual_counts, target_counts = allocate_files(
+            class_data[class_name]["valid_files"], 
+            target_per_class, 
+            split_ratios
+        )
+        
+        train_f, val_f, test_f = file_lists
+        print(f"  -> {class_name.upper()}:")
+        print(f"     Target | Train: {target_counts[0]:<6} | Val: {target_counts[1]:<6} | Test: {target_counts[2]:<6}")
+        print(f"     Actual | Train: {actual_counts[0]:<6} | Val: {actual_counts[1]:<6} | Test: {actual_counts[2]:<6}")
+
+        for fpath in train_f:
+            tasks.append((fpath, out_paths[class_name]["train"], "train", class_name, fpath.stem, d, fs, window_seconds, overlap, catalog))
+        for fpath in val_f:
+            tasks.append((fpath, out_paths[class_name]["val"], "val", class_name, fpath.stem, d, fs, window_seconds, overlap, catalog))
+        for fpath in test_f:
+            tasks.append((fpath, out_paths[class_name]["test"], "test", class_name, fpath.stem, d, fs, window_seconds, overlap, catalog))
+
+    print(f"\n[PHASE 4] Processing {len(tasks)} file generation tasks on {num_cores} cores...")
+    
+    csv_buffer = {s: [] for s in splits}
+    
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores) as executor:
+        for result in executor.map(_process_task, tasks):
+            if isinstance(result, str):
+                print(result)
+            elif result:
+                for item in result:
+                    csv_buffer[item['split']].append([item['filename'], item['class'], item['magnitude']])
+
+    print("\n[PHASE 5] Writing labels to CSV...")
+    for split in splits:
+        if csv_buffer[split]:
+            with open(csv_paths[split], 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerows(csv_buffer[split])
+                
+    print("\n[COMPLETE] Balanced dataset generation finished successfully!")
+
+
+# MAIN WRAPPER 
+
+if __name__ == "__main__":
+    
+    BASE_WAVEFORMS_DIR = Path("data/batched_waveforms")
+    NOISE_BATCH_DIR = "data/batched_noise_waveforms"
+    CATALOG_CSV = "catalogs/extracted_earthquakes.csv"
+    
+    target_directories = [
+        "window_post_60s",
+        "window_post_100s",
+        "window_post_120s",
+        "window_post_200s",
+        "window_pre_100s",
+        "window_pre_200s"
+    ]
+    
+    for dir_name in target_directories:
+        match = re.search(r'(\d+)s$', dir_name)
+        if not match:
+            print(f"[WARN] Could not parse window seconds from {dir_name}. Skipping...")
+            continue
+            
+        nominal_window_secs = float(match.group(1))
+        eq_dir = BASE_WAVEFORMS_DIR / dir_name
+        
+        if not eq_dir.exists():
+            print(f"[WARN] Directory {eq_dir} does not exist. Skipping...")
+            continue
+
+        output_dir = f"dataset_{dir_name}"
+        
+        print(f"\n{'#'*60}")
+        print(f"RUNNING PIPELINE FOR: {dir_name} (Window Size: {nominal_window_secs}s)")
+        print(f"{'#'*60}\n")
+        
+        run_balanced_preprocessing(
+            eq_dir=str(eq_dir),
+            noise_dir=NOISE_BATCH_DIR,
+            catalog_csv_path=CATALOG_CSV,
+            output_dir=output_dir,
+            split_ratios=(0.70, 0.15, 0.15),
+            d=24,
+            fs=100.0, 
+            window_seconds=nominal_window_secs,
+            overlap=0.50,
+            # limit_pictures=10000,
+        )
