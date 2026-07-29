@@ -156,19 +156,23 @@ def scan_single_mseed(args: Tuple[Path, float, float, float]) -> Tuple[Path, Dic
 
 def mseed_file_to_ram_rgb(
     file_path: Path,
-    station_assignments: Dict[str, Tuple[str, Path]],  # sta_key -> (split_name, out_dir)
+    station_assignments: Dict[str, Tuple[str, str, Path]],  # sta_key -> (split_name, class_name, out_dir)
     target_n: int,
     fs: float,
     window_seconds: float,
     overlap: float,
-) -> List[Tuple[str, str, str]]:
+) -> List[Tuple[str, str, str, str, str]]:
     """
     Reads one mseed file ONCE and writes output only for the stations present
-    in `station_assignments`, each to its assigned split's directory. This is
-    what lets a single event file contribute stations to different splits
-    without re-reading the file once per station.
+    in `station_assignments`, each to its assigned split's directory.
 
-    Returns a list of (split_name, station_key, filename) manifest entries.
+    Returns a list of (split_name, class_name, station_key, file_path, filename)
+    manifest entries. class_name comes directly from the assignment made when
+    this station was allocated to a split -- NOT reconstructed later from a
+    station->class lookup, since the same physical station can legitimately
+    belong to BOTH classes (it recorded a real earthquake AND provided a noise
+    window elsewhere in time). A single global per-station label would silently
+    collide for any station in both classes.
     """
     st = read(str(file_path))
     try:
@@ -210,7 +214,7 @@ def mseed_file_to_ram_rgb(
 
         windows = window_array(event_data, fs=actual_fs, window_seconds=window_seconds, overlap=overlap)
 
-        split_name, out_dir = station_assignments[sta_key]
+        split_name, class_name, out_dir = station_assignments[sta_key]
 
         for w_idx, win in enumerate(windows):
             cleaned_win = np.zeros_like(win, dtype=np.float64)
@@ -230,7 +234,7 @@ def mseed_file_to_ram_rgb(
 
             filename = f"{file_id}_{sta_key}_win{w_idx:03d}.png"
             img.save(out_dir / filename)
-            manifest_rows.append((split_name, sta_key, filename))
+            manifest_rows.append((split_name, class_name, sta_key, str(file_path), filename))
 
     return manifest_rows
 
@@ -283,12 +287,12 @@ def _cap_station_windows(
     return capped
 
 
-def _write_split_manifest(manifest_path: Path, entries: List[Tuple[str, str, str, str]]) -> None:
-    """entries: (split, class_name, station_key, filename)"""
+def _write_split_manifest(manifest_path: Path, entries: List[Tuple[str, str, str, str, str]]) -> None:
+    """entries: (split, class_name, station_key, file_path, filename)"""
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     with open(manifest_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['split', 'class_name', 'station_key', 'filename'])
+        writer.writerow(['split', 'class_name', 'station_key', 'file_path', 'filename'])
         writer.writerows(entries)
 
 
@@ -396,9 +400,8 @@ def run_balanced_preprocessing(
 
     print("\n[PHASE 3] Allocating STATION-disjoint splits...")
 
-    # file_path -> {sta_key: (split_name, out_dir)}  -- grouped so each file is read once
-    file_to_assignments: Dict[Path, Dict[str, Tuple[str, Path]]] = {}
-    split_station_manifest: List[Tuple[str, str, str]] = []  # (split, class_name, station_key)
+    # file_path -> {sta_key: (split_name, class_name, out_dir)}  -- grouped so each file is read once
+    file_to_assignments: Dict[Path, Dict[str, Tuple[str, str, Path]]] = {}
 
     random.seed(42)
 
@@ -430,10 +433,17 @@ def run_balanced_preprocessing(
                 break
 
             out_dir = out_paths[class_name][split_name]
-            split_station_manifest.append((split_name, class_name, sta_key))
 
             for fpath, _ in file_contribs:
-                file_to_assignments.setdefault(fpath, {})[sta_key] = (split_name, out_dir)
+                # class_name is captured HERE, at the point the assignment is
+                # actually made -- never reconstructed later from a per-station
+                # lookup, since the same physical station can legitimately be
+                # assigned once as earthquake (from an eq_dir file) and once as
+                # noise (from a different noise_dir file). Keying file_to_assignments
+                # by fpath (which differs between the two directories) means this
+                # never collides -- each (file, station) pair keeps its own,
+                # correct class_name.
+                file_to_assignments.setdefault(fpath, {})[sta_key] = (split_name, class_name, out_dir)
 
         print(f"  -> {class_name.upper()}:")
         print(f"     Target windows | Train: {target_train:<6} | Val: {target_val:<6} | Test: {target_test:<6}")
@@ -448,24 +458,17 @@ def run_balanced_preprocessing(
     print(f"\n[PHASE 4] Processing {len(tasks)} file-level tasks "
           f"(each file read once, only assigned stations written) on {num_cores} cores...")
 
-    file_manifest_rows: List[Tuple[str, str, str]] = []  # (split, station_key, filename)
+    # (split, class_name, station_key, file_path, filename) -- class_name comes
+    # straight from mseed_file_to_ram_rgb now, no reconstruction needed.
+    full_manifest: List[Tuple[str, str, str, str, str]] = []
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores) as executor:
         for result in executor.map(_process_task, tasks):
             if isinstance(result, str):
                 print(result)
             elif result:
-                file_manifest_rows.extend(result)
+                full_manifest.extend(result)
 
     print("\n[PHASE 5] Writing manifest...")
-    station_to_class = {}
-    for class_name, _ in classes:
-        for sta_key, _, _ in class_data[class_name]["valid_sources"]:
-            station_to_class[sta_key] = class_name
-
-    full_manifest = [
-        (split, station_to_class.get(sta_key, "unknown"), sta_key, filename)
-        for split, sta_key, filename in file_manifest_rows
-    ]
     manifest_path = Path(output_dir) / "manifest.csv"
     _write_split_manifest(manifest_path, full_manifest)
     print(f"  -> Wrote {len(full_manifest)} entries to {manifest_path}")
