@@ -74,7 +74,7 @@ if __name__ == "__main__":
     input_csv = "catalogs/deprem_katalog_utc.csv"
 
     # Set this to whatever size threshold defines "larger events" for your use case.
-    MIN_MAGNITUDE = 4.0
+    MIN_MAGNITUDE = 2.0
 
     extract_earthquakes(
         input_csv,
