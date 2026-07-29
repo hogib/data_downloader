@@ -12,9 +12,7 @@ import scipy.signal as signal
 from obspy import read
 from PIL import Image
 
-# ==========================================
 # ALGORITHM FUNCTIONS
-# ==========================================
 
 def standardize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     x = np.asarray(x, dtype=np.float64)
@@ -25,24 +23,33 @@ def standardize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     return (x - mu) / sigma
 
 
-def reshape_to_d_by_n(x: np.ndarray, d: int) -> np.ndarray:
+def reshape_to_target_n(x: np.ndarray, target_n: int) -> Tuple[np.ndarray, int]:
+    """
+    Reshape a 1D array into a (d, target_n) matrix, choosing d so that the
+    output ALWAYS has exactly `target_n` columns -- regardless of how long
+    the input window is.
+
+    This replaces the old fixed-`d` approach. With a fixed `d`, short windows
+    (e.g. a 3s window at 100 Hz = 300 samples) collapsed into tiny images
+    (300 // 100 = 3x3 pixels), destroying almost all spatial information.
+    By deriving `d` from the desired resolution instead, every window length
+    produces a full-resolution image with no resizing/interpolation needed
+    afterward -- every pixel is still a directly computed cosine-angle
+    difference between real local feature vectors, never an interpolated one.
+    """
     m = len(x)
-    # Calculate how much padding is needed to make m perfectly divisible by d
-    pad_len = (d - (m % d)) % d
-    
-    if pad_len > 0:
-        # Pad the end with zeros to avoid wraparound artifacts
-        x = np.pad(x, (0, pad_len), mode='constant', constant_values=0)
-        
-    n = len(x) // d
-    
-    # Reshape is infinitely faster than a double nested for-loop
-    return x.reshape((n, d)).T
+    d = max(2, math.ceil(m / target_n))
+    total_needed = d * target_n
+    if total_needed > m:
+        x = np.pad(x, (0, total_needed - m), mode='constant', constant_values=0)
+    else:
+        x = x[:total_needed]
+    return x.reshape((target_n, d)).T, d
 
 
-def ram_matrix(x: np.ndarray, d: int, eps: float = 1e-12) -> np.ndarray:
+def ram_matrix(x: np.ndarray, target_n: int, eps: float = 1e-12) -> Tuple[np.ndarray, int]:
     x_std = standardize(x, eps=eps)
-    M = reshape_to_d_by_n(x_std, d=d)
+    M, d = reshape_to_target_n(x_std, target_n=target_n)
     X_cols = M
     Xbar = np.mean(X_cols, axis=1)
     norm_Xbar = np.linalg.norm(Xbar)
@@ -58,7 +65,7 @@ def ram_matrix(x: np.ndarray, d: int, eps: float = 1e-12) -> np.ndarray:
         cos_val = np.dot(Xi, Xbar) / (norm_Xi * norm_Xbar)
         cos_val = np.clip(cos_val, -1.0, 1.0)
         betas[i] = np.arccos(cos_val)
-    return betas[None, :] - betas[:, None]
+    return betas[None, :] - betas[:, None], d
 
 
 def to_uint8(mat: np.ndarray) -> np.ndarray:
@@ -82,9 +89,14 @@ def clean_and_filter_1d(x: np.ndarray, fs: float, freqmin: float, freqmax: float
         window = signal.windows.hann(taper_len * 2)
         x[:taper_len] *= window[:taper_len]
         x[-taper_len:] *= window[-taper_len:]
-    if fs / 2 > freqmax:
-        b, a = signal.butter(4, [freqmin, freqmax], btype='bandpass', fs=fs)
+
+    nyquist = fs / 2.0
+    actual_freqmax = freqmax if nyquist > freqmax else nyquist - 1.0
+
+    if actual_freqmax > freqmin:
+        b, a = signal.butter(4, [freqmin, actual_freqmax], btype='bandpass', fs=fs)
         x = signal.filtfilt(b, a, x)
+
     return x
 
 
@@ -123,9 +135,7 @@ def window_array(data: np.ndarray, fs: float = 100.0, window_seconds: float = 60
     return windows
 
 
-# ==========================================
 # PRE-SCAN LOGIC
-# ==========================================
 
 def scan_single_mseed(args: Tuple[Path, float, float, float]) -> Tuple[Path, int]:
     file_path, nominal_fs, window_seconds, overlap = args
@@ -167,11 +177,9 @@ def scan_single_mseed(args: Tuple[Path, float, float, float]) -> Tuple[Path, int
     return file_path, total_windows_in_file
 
 
-# ==========================================
 # PROCESSING LOGIC
-# ==========================================
 
-def mseed_file_to_ram_rgb(file_path: Path, out_dir: Path, file_id: str, d: int, nominal_fs: float, window_seconds: float, overlap: float):
+def mseed_file_to_ram_rgb(file_path: Path, out_dir: Path, split: str, file_id: str, target_n: int, nominal_fs: float, window_seconds: float, overlap: float):
     st = read(str(file_path))
     try:
         st.merge(method=1, fill_value='interpolate')
@@ -191,6 +199,7 @@ def mseed_file_to_ram_rgb(file_path: Path, out_dir: Path, file_id: str, d: int, 
 
     target_samples = int(actual_fs * window_seconds)
     tolerance_samples = int(target_samples * 0.05)
+    results = []
     
     for sta_key, channels in stations.items():
         available_chans = sorted(channels.keys())
@@ -217,31 +226,37 @@ def mseed_file_to_ram_rgb(file_path: Path, out_dir: Path, file_id: str, d: int, 
                 cleaned_win[:, i] = clean_and_filter_1d(win[:, i], actual_fs, 1.0, 45.0)
 
             # Generate the RAM matrices using the safely tapered window
-            ram_B = to_uint8(ram_matrix(cleaned_win[:, 0], d=d)) 
-            ram_G = to_uint8(ram_matrix(cleaned_win[:, 1], d=d)) 
-            ram_R = to_uint8(ram_matrix(cleaned_win[:, 2], d=d)) 
+            ram_B_mat, d_used = ram_matrix(cleaned_win[:, 0], target_n=target_n)
+            ram_G_mat, _ = ram_matrix(cleaned_win[:, 1], target_n=target_n)
+            ram_R_mat, _ = ram_matrix(cleaned_win[:, 2], target_n=target_n)
             
+            ram_B = to_uint8(ram_B_mat)
+            ram_G = to_uint8(ram_G_mat)
+            ram_R = to_uint8(ram_R_mat)
+
+
             # Save the image
             rgb = np.stack([ram_R, ram_G, ram_B], axis=-1)
             img = Image.fromarray(rgb, mode="RGB")
+            filename = f"{file_id}_{sta_key}_win{w_idx:03d}.png"
             img.save(out_dir / f"{file_id}_{sta_key}_win{w_idx:03d}.png")
 
 
+
+
 def _process_task(args):
-    file_path, out_dir, file_id, d, fs, window_seconds, overlap = args
+    file_path, out_dir, split, file_id, target_n, fs, window_seconds, overlap = args
     try:
-        mseed_file_to_ram_rgb(file_path, out_dir, file_id, d, fs, window_seconds, overlap)
-        return None 
+        return mseed_file_to_ram_rgb(file_path, out_dir, split, file_id, target_n, fs, window_seconds, overlap )
     except Exception as e:
         return f"[WARN] Failed file {file_id}: {e}"
 
 
-# ==========================================
 # ORCHESTRATION 
-# ==========================================
 
 def allocate_files(valid_files_with_counts: list, target_total: int, split_ratios: tuple) -> tuple:
     """Helper function to cleanly split files into Train/Val/Test based on a strict total target."""
+    random.seed(42)
     random.shuffle(valid_files_with_counts)
 
     target_train = int(target_total * split_ratios[0])
@@ -273,7 +288,7 @@ def run_balanced_preprocessing(
     noise_dir: str, 
     output_dir: str, 
     split_ratios: tuple = (0.70, 0.15, 0.15),
-    d: int = 64, 
+    target_n: int = 64,
     fs: float = 100.0,
     window_seconds: float = 60.0,
     overlap: float = 0.5,
@@ -363,12 +378,11 @@ def run_balanced_preprocessing(
 
         # Build execution tasks
         for fpath in train_f:
-            tasks.append((fpath, out_paths[class_name]["train"], fpath.stem, d, fs, window_seconds, overlap))
+            tasks.append((fpath, out_paths[class_name]["train"], "train", fpath.stem, target_n, fs, window_seconds, overlap))
         for fpath in val_f:
-            tasks.append((fpath, out_paths[class_name]["val"], fpath.stem, d, fs, window_seconds, overlap))
+            tasks.append((fpath, out_paths[class_name]["val"], "val", fpath.stem, target_n, fs, window_seconds, overlap))
         for fpath in test_f:
-            tasks.append((fpath, out_paths[class_name]["test"], fpath.stem, d, fs, window_seconds, overlap))
-
+            tasks.append((fpath, out_paths[class_name]["test"], "test", fpath.stem, target_n, fs, window_seconds, overlap))
     # Generate Data
     print(f"\n[PHASE 4] Processing {len(tasks)} file generation tasks on {num_cores} cores...")
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores) as executor:
@@ -379,9 +393,7 @@ def run_balanced_preprocessing(
     print("\n[COMPLETE] Balanced dataset generation finished successfully!")
 
 
-# ==========================================
 # MAIN WRAPPER 
-# ==========================================
 
 if __name__ == "__main__":
     
@@ -390,12 +402,12 @@ if __name__ == "__main__":
     
     target_directories = [
         "window_post_60s",
-        "window_post_100s",
-        "window_post_120s",
-        "window_post_200s",
-        "window_pre_100s",
-        "window_pre_200s"
-    ]
+    #     "window_post_100s",
+    #     "window_post_120s",
+    #     "window_post_200s",
+     ]
+
+    TARGET_N = 64
     
     for dir_name in target_directories:
         match = re.search(r'(\d+)s$', dir_name)
@@ -421,7 +433,7 @@ if __name__ == "__main__":
             noise_dir=NOISE_BATCH_DIR,       
             output_dir=output_dir,        
             split_ratios=(0.70, 0.15, 0.15), 
-            d=24,
+            target_n=TARGET_N,
             fs=100.0, 
             window_seconds=nominal_window_secs,        
             overlap=0.50,
