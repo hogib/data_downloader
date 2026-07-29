@@ -70,9 +70,15 @@ def clean_and_filter_1d(x: np.ndarray, fs: float, freqmin: float, freqmax: float
         window = signal.windows.hann(taper_len * 2)
         x[:taper_len] *= window[:taper_len]
         x[-taper_len:] *= window[-taper_len:]
-    if fs / 2 > freqmax:
-        b, a = signal.butter(4, [freqmin, freqmax], btype='bandpass', fs=fs)
+        
+    nyquist = fs / 2.0
+    actual_freqmax = freqmax if nyquist > freqmax else nyquist - 1.0
+    
+    # Ensure we still have a valid bandpass range before applying
+    if actual_freqmax > freqmin:
+        b, a = signal.butter(4, [freqmin, actual_freqmax], btype='bandpass', fs=fs)
         x = signal.filtfilt(b, a, x)
+        
     return x
 
 
@@ -106,9 +112,6 @@ def window_array(data: np.ndarray, fs: float = 100.0, window_seconds: float = 60
 # CATALOG & METADATA LOGIC
 
 def load_catalog(catalog_csv_path: Optional[str]) -> Dict[str, float]:
-    """
-    Parses the catalog CSV file and returns a dictionary mapping EventID -> Magnitude.
-    """
     catalog = {}
     if not catalog_csv_path or not Path(catalog_csv_path).exists():
         print(f"[INFO] No valid catalog CSV provided or file does not exist at '{catalog_csv_path}'. Skipping catalog mapping.")
@@ -133,40 +136,36 @@ def load_catalog(catalog_csv_path: Optional[str]) -> Dict[str, float]:
 
 
 def extract_magnitude(st, file_path: Path, class_name: str, catalog: Dict[str, float]) -> Optional[float]:
-    """
-    Extracts magnitude using the CSV catalog first, with fallbacks to trace stats or filename regex.
-    """
     if "noise" in class_name.lower():
         return 0.0
 
-    # 1. Primary Lookup: EventID in Filename
-    filename = file_path.name
-    stem = file_path.stem
-    
-    # Check if any EventID key exists as a substring in the filename
-    for event_id, mag in catalog.items():
-        if event_id in stem or event_id in filename:
-            return mag
+    match_id = re.search(r'(\d{6,})', file_path.name)
+    if match_id:
+        event_id = match_id.group(1)
+        if event_id in catalog:
+            return catalog[event_id]
 
-    # 2. Secondary Lookup: SAC Headers inside MSEED
     if hasattr(st[0].stats, 'sac') and 'mag' in st[0].stats.sac:
         return float(st[0].stats.sac.mag)
         
-    # 3. Fallback: Parse magnitude patterns in filename (e.g., M3.9 or mag_3.9)
-    match = re.search(r'(?:mag|M|m)[\s_]*(\d+(?:\.\d+)?)', filename)
-    if match:
-        return float(match.group(1))
+    match_mag = re.search(r'(?:mag|M|m)[\s_]*(\d+(?:\.\d+)?)', file_path.name)
+    if match_mag:
+        return float(match_mag.group(1))
 
     return None
 
 # PRE-SCAN LOGIC
 
-def scan_single_mseed(args: Tuple[Path, float, float, float]) -> Tuple[Path, int]:
-    file_path, nominal_fs, window_seconds, overlap = args
+def scan_single_mseed(args: Tuple[Path, float, float, float, str, dict]) -> Tuple[Path, int]:
+    file_path, nominal_fs, window_seconds, overlap, class_name, catalog = args
     try:
         st = read(str(file_path), headonly=True)
     except Exception as e:
         print(f"\n[ERROR] Obspy failed to read {file_path.name}: {e}")
+        return file_path, 0
+
+    mag = extract_magnitude(st, file_path, class_name, catalog)
+    if mag is None:
         return file_path, 0
 
     actual_fs = st[0].stats.sampling_rate 
@@ -281,9 +280,12 @@ def _process_task(args):
     except Exception as e:
         return f"[WARN] Failed file {file_id}: {e}"
 
+# ==========================================
 # ORCHESTRATION 
+# ==========================================
 
 def allocate_files(valid_files_with_counts: list, target_total: int, split_ratios: tuple) -> tuple:
+    random.seed(42)
     random.shuffle(valid_files_with_counts)
 
     target_train = int(target_total * split_ratios[0])
@@ -326,7 +328,6 @@ def run_balanced_preprocessing(
     print("STARTING DATASET GENERATION")
     print("="*60)
     
-    # Load catalog lookup dictionary
     catalog = load_catalog(catalog_csv_path)
     
     classes = [("01_earthquake", Path(eq_dir)), ("00_noise", Path(noise_dir))]
@@ -359,7 +360,7 @@ def run_balanced_preprocessing(
             continue
             
         mseed_files = list(source_path.rglob("*.mseed"))
-        scan_args = [(fp, fs, window_seconds, overlap) for fp in mseed_files]
+        scan_args = [(fp, fs, window_seconds, overlap, class_name, catalog) for fp in mseed_files]
         
         valid_files = []
         total_windows = 0
@@ -447,12 +448,12 @@ if __name__ == "__main__":
     CATALOG_CSV = "catalogs/extracted_earthquakes.csv"
     
     target_directories = [
+        "window_post_3s",
+        "window_post_6s",
         "window_post_60s",
         "window_post_100s",
         "window_post_120s",
         "window_post_200s",
-        "window_pre_100s",
-        "window_pre_200s"
     ]
     
     for dir_name in target_directories:
@@ -475,14 +476,13 @@ if __name__ == "__main__":
         print(f"{'#'*60}\n")
         
         run_balanced_preprocessing(
-            eq_dir=str(eq_dir),
-            noise_dir=NOISE_BATCH_DIR,
+            eq_dir=str(eq_dir),      
+            noise_dir=NOISE_BATCH_DIR, 
             catalog_csv_path=CATALOG_CSV,
-            output_dir=output_dir,
-            split_ratios=(0.70, 0.15, 0.15),
-            d=24,
+            output_dir=output_dir,        
+            split_ratios=(0.70, 0.15, 0.15), 
+            d=100,
             fs=100.0, 
-            window_seconds=nominal_window_secs,
+            window_seconds=nominal_window_secs,        
             overlap=0.50,
-            # limit_pictures=10000,
         )
