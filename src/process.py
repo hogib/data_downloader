@@ -508,6 +508,16 @@ if __name__ == "__main__":
         print(f"RUNNING PIPELINE FOR: {dir_name} (Window Size: {nominal_window_secs}s)")
         print(f"{'#'*60}\n")
 
+        # Short windows let a single long noise trace produce thousands of
+        # overlapping slices via window_array -- easily more than an entire
+        # split's target on its own, which collapses the noise side down to
+        # 1-2 stations (this is exactly what happened on window_post_3s_anchored
+        # before this cap was added: noise test drew from a single station).
+        # Earthquake-side windows are unaffected by this since the *_anchored
+        # files are already sliced to exactly the target length -- overlap
+        # can't multiply a window out of a file with no room left to slide in.
+        station_cap = 100 if nominal_window_secs <= 10 else None
+
         run_balanced_preprocessing(
             eq_dir=str(eq_dir),
             noise_dir=NOISE_BATCH_DIR,
@@ -516,6 +526,6 @@ if __name__ == "__main__":
             target_n=TARGET_N,
             fs=100.0,
             window_seconds=nominal_window_secs,
-            overlap=0.50,
-            max_windows_per_station=None,  # set a cap once Phase 1 shows you the per-station distribution
+            overlap=0.25,
+            max_windows_per_station=station_cap,
         )

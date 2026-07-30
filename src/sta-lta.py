@@ -19,15 +19,15 @@ from obspy.signal.trigger import classic_sta_lta
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                              roc_auc_score, roc_curve)
 
-MANIFEST_PATH = Path("dataset_window_post_60s/manifest.csv")
+MANIFEST_PATH = Path("dataset_window_post_6s_anchored/manifest.csv")
 SPLIT_TO_EVALUATE = "test"
 
 FS = 100.0
-WINDOW_SECONDS = 60.0  # must match what the generator used for this dataset
+WINDOW_SECONDS = 6.0  # must match what the generator used for this dataset
 OVERLAP = 0.50          # must match what the generator used for this dataset
 
-STA_SECONDS = 1.0
-LTA_SECONDS = 10.0  # must be comfortably shorter than WINDOW_SECONDS
+STA_SECONDS = 0.5
+LTA_SECONDS = 2.0  # must be comfortably shorter than WINDOW_SECONDS
 
 FILENAME_RE = re.compile(r"_win(\d+)\.png$")
 

@@ -1,6 +1,7 @@
 import re
 from pathlib import Path
 
+# Import the core function from your existing script (assuming it's named preprocess.py)
 from src.process import run_balanced_preprocessing
 
 
@@ -9,16 +10,21 @@ def main():
     noise_batch_dir = "data/batched_noise_waveforms"
 
     target_directories = [
-        "window_post_3s",
-        "window_post_6s",
-        "window_post_60s",
-        "window_post_100s",
-        "window_post_120s",
-        "window_post_200s",
+        "window_post_3s_anchored",
+        "window_post_6s_anchored",
+        # "window_post_100s",
+        # "window_post_120s",
+        # "window_post_200s",
+        # "window_pre_100s",
+        # "window_pre_200s"
     ]
 
     for dir_name in target_directories:
-        match = re.search(r'(\d+)s$', dir_name)
+        # (?=_|$) lets this match "window_post_6s" (end of string) AND
+        # "window_post_6s_anchored" (followed by an underscore) -- the old
+        # r'(\d+)s$' required digits+s to be the very last thing in the
+        # string, which silently skipped every *_anchored directory.
+        match = re.search(r'(\d+)s(?=_|$)', dir_name)
         if not match:
             print(f"[WARN] Could not parse window seconds from {dir_name}. Skipping...")
             continue
@@ -42,6 +48,15 @@ def main():
             print(f"[ERROR] Directory {eq_dir} does not exist. Skipping...")
             continue
 
+        # Short windows (with overlap) let a single long noise trace produce
+        # thousands of overlapping slices -- easily more than an entire
+        # split's target on its own, which collapses the noise side down to
+        # 1-2 stations (see: window_post_3s_anchored producing a test set
+        # drawn from a single noise station). Cap harder for shorter windows;
+        # 60s+ windows don't produce nearly enough volume per station for
+        # this to be an issue, so leave those uncapped.
+        station_cap = 100 if nominal_window_secs <= 10 else None
+
         run_balanced_preprocessing(
             eq_dir=eq_dir,
             noise_dir=noise_batch_dir,
@@ -51,6 +66,7 @@ def main():
             fs=100.0,
             window_seconds=actual_window_secs,
             overlap=0.25,
+            max_windows_per_station=station_cap,
         )
 
 
