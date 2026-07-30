@@ -484,7 +484,8 @@ if __name__ == "__main__":
     NOISE_BATCH_DIR = "data/batched_noise_waveforms"
 
     target_directories = [
-        "window_post_60s",
+        "window_post_3s_anchored",
+        "window_post_6s_anchored",
     ]
 
     TARGET_N = 64
@@ -516,7 +517,12 @@ if __name__ == "__main__":
         # Earthquake-side windows are unaffected by this since the *_anchored
         # files are already sliced to exactly the target length -- overlap
         # can't multiply a window out of a file with no room left to slide in.
-        station_cap = 100 if nominal_window_secs <= 10 else None
+        # 100 was enough to stop single-station domination, but still large
+        # enough that val/test's much smaller targets (~276-278 windows) only
+        # needed 3 stations to satisfy -- e.g. 278/100 ≈ 2.8. Lowering to 20
+        # forces roughly 14+ stations to fill val/test, comparable to the
+        # diversity already achieved on the earthquake side.
+        station_cap = 20 if nominal_window_secs <= 10 else None
 
         run_balanced_preprocessing(
             eq_dir=str(eq_dir),

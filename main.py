@@ -55,7 +55,7 @@ def main():
         # drawn from a single noise station). Cap harder for shorter windows;
         # 60s+ windows don't produce nearly enough volume per station for
         # this to be an issue, so leave those uncapped.
-        station_cap = 100 if nominal_window_secs <= 10 else None
+        station_cap = 20 if nominal_window_secs <= 10 else None
 
         run_balanced_preprocessing(
             eq_dir=eq_dir,
