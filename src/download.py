@@ -9,12 +9,12 @@ from obspy.clients.fdsn import Client
 # Earthquake waveform windows: (window_name, start_offset_sec, end_offset_sec)
 EARTHQUAKE_BATCHES = [
     ("window_post_60s", 0, 60),
-    ("window_post_120s", 0, 120),
-    ("window_post_200s", 0, 200),
-    ("window_post_100s", 0, 100),
-    ("window_post_3s", 0, 3),
-    ("window_post_6s", 0, 6),
-    ("window_post_10s", 0, 10),
+    # ("window_post_120s", 0, 120),
+    # ("window_post_200s", 0, 200),
+    # ("window_post_100s", 0, 100),
+    # ("window_post_3s", 0, 3),
+    # ("window_post_6s", 0, 6),
+    # ("window_post_10s", 0, 10),
 ]
 
 # Noise waveform windows: (window_name, start_offset_sec, end_offset_sec)
@@ -31,7 +31,7 @@ FULL_CATALOG_FILE = Path("catalogs/deprem_katalog_utc.csv")  # unfiltered: the c
                                                               # were filtered out of the download list, e.g.
                                                               # small quakes below your magnitude threshold)
 BASE_OUTPUT_DIR = Path("data")
-FILE_LIMIT = 10000  # Set to None to process the full catalog
+FILE_LIMIT = 100000  # Set to None to process the full catalog
 SEARCH_RADIUS_DEG = 0.5  # ~55 km radius around event
 FDSN_CLIENT = "KOERI"
 MAX_WORKERS = 15  # Number of concurrent threads
