@@ -22,6 +22,27 @@ from seismic_cli.core import select_components
 
 FILENAME_RE = re.compile(r"_win(\d+)\.png$")
 
+# Floors/caps for the dynamically derived STA/LTA parameters.
+MIN_STA_SECONDS = 0.05   # 5 samples at 100 Hz -- shorter is just noise
+MAX_LTA_SECONDS = 10.0   # classic long-term average for full-length windows
+
+
+def derive_sta_lta_params(window_seconds: float) -> tuple:
+    """
+    Derives (sta_seconds, lta_seconds) from the analysis window length.
+
+    The classic 1s/10s defaults only make sense when the window is much
+    longer than the LTA -- on a 3s or 6s window a 10s LTA cannot even be
+    computed, and the whole baseline silently degenerates. Scaling rule:
+    LTA = window/3 (capped at the classic 10s), STA = LTA/10 (floored at
+    MIN_STA_SECONDS). At 60s this reproduces the original 1.0/10.0 exactly,
+    so existing long-window results are unchanged; at 6s it yields 0.2/2.0
+    and at 3s 0.1/1.0.
+    """
+    lta_seconds = min(MAX_LTA_SECONDS, window_seconds / 3.0)
+    sta_seconds = max(MIN_STA_SECONDS, lta_seconds / 10.0)
+    return sta_seconds, lta_seconds
+
 
 def extract_window_index(filename: str) -> Optional[int]:
     match = FILENAME_RE.search(filename)
@@ -113,9 +134,18 @@ def run_eval_sta_lta(
     fs: float = 100.0,
     window_seconds: float = 60.0,
     overlap: float = 0.5,
-    sta_seconds: float = 1.0,
-    lta_seconds: float = 10.0,
+    sta_seconds: Optional[float] = None,
+    lta_seconds: Optional[float] = None,
 ) -> None:
+    auto_sta, auto_lta = derive_sta_lta_params(window_seconds)
+    derived = sta_seconds is None or lta_seconds is None
+    if sta_seconds is None:
+        sta_seconds = auto_sta
+    if lta_seconds is None:
+        lta_seconds = auto_lta
+    source = "auto-derived from window length" if derived else "explicitly set"
+    print(f"[params] window={window_seconds:g}s -> STA={sta_seconds:g}s, LTA={lta_seconds:g}s ({source})")
+
     manifest_path = Path(manifest_path)
     print(f"[load] Reading manifest: {manifest_path}")
     df = pd.read_csv(manifest_path)
