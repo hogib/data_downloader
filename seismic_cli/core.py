@@ -545,9 +545,16 @@ def run_balanced_preprocessing(
     min_baseline_seconds: float = 60.0,
     num_cores: Optional[int] = None,
     max_gap_fraction: float = 0.05,
+    generate_max: bool = False,
 ):
+    if generate_max and limit_pictures:
+        raise ValueError("generate_max and limit_pictures are mutually exclusive: "
+                         "--max means 'as many images as the data allows'.")
+
     print("=" * 60)
     mode_label = "baseline-standardized" if use_baseline_standardization else "plain per-window standardization"
+    if generate_max:
+        mode_label += ", MAX mode"
     print(f"STARTING DATASET GENERATION (station-disjoint splits, {mode_label})")
     print("=" * 60)
     if max_windows_per_station is not None:
@@ -646,15 +653,21 @@ def run_balanced_preprocessing(
         print("[ERROR] One of the classes has 0 valid windows. Aborting this folder.")
         return
 
-    bottleneck_size = min(eq_total, noise_total)
-
-    if limit_pictures:
-        target_per_class = min(bottleneck_size, limit_pictures // 2)
+    if generate_max:
+        print(f"  -> MAX mode: class totals are {eq_total} earthquake / {noise_total} noise windows.")
+        print("  -> Every usable station will be assigned to a split; the surplus class is then "
+              "trimmed per split (evenly-spaced window subsampling) to match the smaller class.")
+        target_per_class = None
     else:
-        target_per_class = bottleneck_size
+        bottleneck_size = min(eq_total, noise_total)
 
-    print(f"  -> Bottleneck dictates a maximum of {bottleneck_size} images per class.")
-    print(f"  -> Final target set to {target_per_class} images per class (Total: {target_per_class * 2} images).")
+        if limit_pictures:
+            target_per_class = min(bottleneck_size, limit_pictures // 2)
+        else:
+            target_per_class = bottleneck_size
+
+        print(f"  -> Bottleneck dictates a maximum of {bottleneck_size} images per class.")
+        print(f"  -> Final target set to {target_per_class} images per class (Total: {target_per_class * 2} images).")
 
     print("\n[PHASE 3] Allocating STATION-disjoint splits (unified across classes)...")
 
@@ -665,12 +678,6 @@ def run_balanced_preprocessing(
             per_station.setdefault(sta_key, {})[class_name] = (w_total, contribs)
 
     splits = ["train", "val", "test"]
-    targets = {}
-    for class_name in class_names:
-        t_train = int(target_per_class * split_ratios[0])
-        t_val = int(target_per_class * split_ratios[1])
-        targets[class_name] = {"train": t_train, "val": t_val,
-                                "test": target_per_class - t_train - t_val}
     counts = {c: {s: 0 for s in splits} for c in class_names}
     n_stations = {c: {s: 0 for s in splits} for c in class_names}
 
@@ -680,39 +687,130 @@ def run_balanced_preprocessing(
 
     file_to_assignments: Dict[Path, Dict[str, Tuple[str, str, Path, Optional[int]]]] = {}
 
-    for sta_key in all_stations:
-        present_classes = list(per_station[sta_key].keys())
+    if generate_max:
+        # --- MAX mode: use everything, then balance by trimming ---
+        #
+        # 1) Assign EVERY station to the split with the largest relative
+        #    deficit against ratio-proportional targets, computed per class
+        #    from that class's FULL window total. No station is dropped.
+        class_totals = {c: class_data[c]["total_windows"] for c in class_names}
+        targets = {c: {s: split_ratios[i] * class_totals[c] for i, s in enumerate(splits)}
+                   for c in class_names}
 
-        # One split per STATION, shared by every class it appears in. This is
-        # the actual station-disjoint guarantee: a station assigned to train
-        # can never surface in val/test under either label.
-        split_name = None
-        for cand in splits:
-            if any(counts[c][cand] < targets[c][cand] for c in present_classes):
-                split_name = cand
+        station_split: Dict[str, str] = {}
+        for sta_key in all_stations:
+            present_classes = list(per_station[sta_key].keys())
+            best_split, best_need = None, None
+            for cand in splits:
+                need = sum((targets[c][cand] - counts[c][cand]) / max(targets[c][cand], 1.0)
+                           for c in present_classes)
+                if best_need is None or need > best_need:
+                    best_split, best_need = cand, need
+            station_split[sta_key] = best_split
+            for class_name in present_classes:
+                w_total, _ = per_station[sta_key][class_name]
+                counts[class_name][best_split] += w_total
+                n_stations[class_name][best_split] += 1
+
+        # 2) Per split, trim the surplus class down to the smaller class by
+        #    assigning per-(station, file) quotas via largest-remainder
+        #    proportional rounding. The smaller class keeps its cap quotas
+        #    untouched. Balance is on scan ESTIMATES; actual generated counts
+        #    can differ slightly (gap rejection, header-vs-merged lengths).
+        planned = {s: {c: counts[c][s] for c in class_names} for s in splits}
+        trim_quota: Dict[Tuple[str, str], Dict[Path, int]] = {}  # (sta, class) -> fpath -> quota
+
+        for split_name in splits:
+            balanced = min(planned[split_name][c] for c in class_names)
+            if balanced == 0:
+                present = {c: planned[split_name][c] for c in class_names}
+                print(f"  [WARN] Split '{split_name}' has a class with 0 windows ({present}) -- "
+                      f"it will be empty after balancing. More stations are needed for this split.")
+            for class_name in class_names:
+                surplus_total = planned[split_name][class_name]
+                if surplus_total <= balanced:
+                    continue
+                entries = []  # (sta_key, fpath, effective_window_count)
+                for sta_key, split_of in station_split.items():
+                    if split_of != split_name or class_name not in per_station[sta_key]:
+                        continue
+                    _w_total, contribs = per_station[sta_key][class_name]
+                    for fpath, w_count, quota in contribs:
+                        entries.append((sta_key, fpath, w_count if quota is None else quota))
+
+                factor = balanced / surplus_total
+                raw = [eff * factor for _, _, eff in entries]
+                base = [int(r) for r in raw]
+                short = balanced - sum(base)
+                by_remainder = sorted(range(len(raw)), key=lambda i: raw[i] - base[i], reverse=True)
+                for i in by_remainder[:short]:
+                    base[i] += 1
+                for (sta_key, fpath, _eff), q in zip(entries, base):
+                    trim_quota.setdefault((sta_key, class_name), {})[fpath] = q
+                planned[split_name][class_name] = balanced
+
+        for sta_key, split_name in station_split.items():
+            for class_name in per_station[sta_key].keys():
+                _w_total, contribs = per_station[sta_key][class_name]
+                out_dir = out_paths[class_name][split_name]
+                file_quotas = trim_quota.get((sta_key, class_name))
+                for fpath, _w_count, quota in contribs:
+                    if file_quotas is not None:
+                        quota = file_quotas.get(fpath, 0)
+                    file_to_assignments.setdefault(fpath, {})[sta_key] = (split_name, class_name, out_dir, quota)
+
+        for class_name in class_names:
+            p = {s: planned[s][class_name] for s in splits}
+            c = counts[class_name]
+            ns = n_stations[class_name]
+            print(f"  -> {class_name.upper()}:")
+            print(f"     Assigned windows | Train: {c['train']:<6} | Val: {c['val']:<6} | Test: {c['test']:<6}")
+            print(f"     After balancing  | Train: {p['train']:<6} | Val: {p['val']:<6} | Test: {p['test']:<6}")
+            print(f"     Stations used    | Train: {ns['train']:<6} | Val: {ns['val']:<6} | Test: {ns['test']:<6}")
+        total_planned = sum(planned[s][c] for s in splits for c in class_names)
+        print(f"     Planned total: {total_planned} images (balanced per split; "
+              f"actuals may differ slightly where windows are rejected at generation time).")
+    else:
+        targets = {}
+        for class_name in class_names:
+            t_train = int(target_per_class * split_ratios[0])
+            t_val = int(target_per_class * split_ratios[1])
+            targets[class_name] = {"train": t_train, "val": t_val,
+                                    "test": target_per_class - t_train - t_val}
+
+        for sta_key in all_stations:
+            present_classes = list(per_station[sta_key].keys())
+
+            # One split per STATION, shared by every class it appears in. This is
+            # the actual station-disjoint guarantee: a station assigned to train
+            # can never surface in val/test under either label.
+            split_name = None
+            for cand in splits:
+                if any(counts[c][cand] < targets[c][cand] for c in present_classes):
+                    split_name = cand
+                    break
+            if split_name is None:
+                continue  # every split this station could help is already full
+
+            for class_name in present_classes:
+                w_total, contribs = per_station[sta_key][class_name]
+                counts[class_name][split_name] += w_total
+                n_stations[class_name][split_name] += 1
+                out_dir = out_paths[class_name][split_name]
+                for fpath, _w_count, quota in contribs:
+                    file_to_assignments.setdefault(fpath, {})[sta_key] = (split_name, class_name, out_dir, quota)
+
+            if all(counts[c][s] >= targets[c][s] for c in class_names for s in splits):
                 break
-        if split_name is None:
-            continue  # every split this station could help is already full
 
-        for class_name in present_classes:
-            w_total, contribs = per_station[sta_key][class_name]
-            counts[class_name][split_name] += w_total
-            n_stations[class_name][split_name] += 1
-            out_dir = out_paths[class_name][split_name]
-            for fpath, _w_count, quota in contribs:
-                file_to_assignments.setdefault(fpath, {})[sta_key] = (split_name, class_name, out_dir, quota)
-
-        if all(counts[c][s] >= targets[c][s] for c in class_names for s in splits):
-            break
-
-    for class_name in class_names:
-        t = targets[class_name]
-        c = counts[class_name]
-        ns = n_stations[class_name]
-        print(f"  -> {class_name.upper()}:")
-        print(f"     Target windows | Train: {t['train']:<6} | Val: {t['val']:<6} | Test: {t['test']:<6}")
-        print(f"     Actual windows | Train: {c['train']:<6} | Val: {c['val']:<6} | Test: {c['test']:<6}")
-        print(f"     Stations used  | Train: {ns['train']:<6} | Val: {ns['val']:<6} | Test: {ns['test']:<6}")
+        for class_name in class_names:
+            t = targets[class_name]
+            c = counts[class_name]
+            ns = n_stations[class_name]
+            print(f"  -> {class_name.upper()}:")
+            print(f"     Target windows | Train: {t['train']:<6} | Val: {t['val']:<6} | Test: {t['test']:<6}")
+            print(f"     Actual windows | Train: {c['train']:<6} | Val: {c['val']:<6} | Test: {c['test']:<6}")
+            print(f"     Stations used  | Train: {ns['train']:<6} | Val: {ns['val']:<6} | Test: {ns['test']:<6}")
     print("     [INFO] Every station occupies exactly one split across BOTH classes.")
 
     tasks = [

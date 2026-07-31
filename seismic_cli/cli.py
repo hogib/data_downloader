@@ -72,7 +72,14 @@ def generate_dataset_cmd(
     train_ratio: float = typer.Option(0.70),
     val_ratio: float = typer.Option(0.15),
     test_ratio: float = typer.Option(0.15),
-    limit_pictures: Optional[int] = typer.Option(None, help="Cap total dataset size (images across both classes)."),
+    limit_pictures: Optional[int] = typer.Option(None, help="Cap total dataset size (images across both classes). "
+                                                             "Mutually exclusive with --max."),
+    generate_max: bool = typer.Option(
+        False, "--max",
+        help="Generate the maximum possible dataset: every usable station is assigned to a "
+             "split (ratios preserved), then the surplus class is trimmed per split via "
+             "evenly-spaced window subsampling so classes stay balanced. Station caps and "
+             "all other constraints still apply. Mutually exclusive with --limit-pictures."),
     max_windows_per_station: Optional[int] = typer.Option(
         None, help="Cap any single station's contribution -- important for short windows, "
                     "where noise stations can otherwise dominate a split."),
@@ -93,8 +100,11 @@ def generate_dataset_cmd(
     from earthquake and noise mseed directories, with a manifest.csv for
     downstream baseline comparisons. Use --baseline to standardize against
     each station's long-term noise statistics instead of per-window
-    self-standardization.
+    self-standardization; use --max to generate the largest balanced dataset
+    the input data supports.
     """
+    if generate_max and limit_pictures:
+        raise typer.BadParameter("--max and --limit-pictures are mutually exclusive.")
     run_balanced_preprocessing(
         eq_dir=eq_dir,
         noise_dir=noise_dir,
@@ -111,6 +121,7 @@ def generate_dataset_cmd(
         freqmax=freqmax,
         min_baseline_seconds=min_baseline_seconds,
         num_cores=num_cores,
+        generate_max=generate_max,
     )
 
 
