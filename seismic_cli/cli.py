@@ -75,7 +75,11 @@ def generate_dataset_cmd(
     limit_pictures: Optional[int] = typer.Option(None, help="Cap total dataset size (images across both classes)."),
     max_windows_per_station: Optional[int] = typer.Option(
         None, help="Cap any single station's contribution -- important for short windows, "
-                    "where noise stations can otherwise dominate a split."),
+                    "where a single long noise trace can produce thousands of overlapping "
+                    "slices and single-handedly dominate a split. If not set, this defaults "
+                    "AUTOMATICALLY to 20 for window_seconds <= 10 (matching what's needed to "
+                    "avoid station collapse at short windows), and no cap for longer windows. "
+                    "Pass 0 to explicitly force NO cap even at short windows."),
     baseline: bool = typer.Option(
         False, "--baseline/--no-baseline",
         help="Standardize each window against that station's long-term noise baseline "
@@ -95,6 +99,18 @@ def generate_dataset_cmd(
     each station's long-term noise statistics instead of per-window
     self-standardization.
     """
+    if max_windows_per_station is None:
+        resolved_cap = 20 if window_seconds <= 10 else None
+        if resolved_cap is not None:
+            print(f"[INFO] --max-windows-per-station not set; auto-applying a cap of "
+                  f"{resolved_cap} (window_seconds <= 10) to prevent single-station "
+                  f"domination. Pass --max-windows-per-station 0 to disable this.")
+    elif max_windows_per_station == 0:
+        resolved_cap = None
+        print("[INFO] Station cap explicitly disabled (--max-windows-per-station 0).")
+    else:
+        resolved_cap = max_windows_per_station
+
     run_balanced_preprocessing(
         eq_dir=eq_dir,
         noise_dir=noise_dir,
@@ -105,7 +121,7 @@ def generate_dataset_cmd(
         window_seconds=window_seconds,
         overlap=overlap,
         limit_pictures=limit_pictures,
-        max_windows_per_station=max_windows_per_station,
+        max_windows_per_station=resolved_cap,
         use_baseline_standardization=baseline,
         freqmin=freqmin,
         freqmax=freqmax,

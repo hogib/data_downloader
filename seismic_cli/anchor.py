@@ -67,6 +67,11 @@ def slice_anchored_window(
 
     return trace_data[start_idx:start_idx + target_samples]
 
+def select_pick_trace(traces: list):
+    z_traces = [tr for tr in traces if tr.stats.channel[-1].upper() == 'Z']
+    if z_traces:
+        return z_traces[0]
+    return sorted(traces, key=lambda t: t.stats.channel)[0]
 
 def process_one_event_file(
     source_path: Path,
@@ -97,7 +102,7 @@ def process_one_event_file(
             continue
 
         fs = traces[0].stats.sampling_rate
-        pick_trace = sorted(traces, key=lambda t: t.stats.channel)[0]
+        pick_trace = select_pick_trace(traces)
         arrival_sample = pick_arrival_sample(
             pick_trace.data.astype(np.float64), fs,
             pick_sta_seconds, pick_lta_seconds, trigger_on, trigger_off,
