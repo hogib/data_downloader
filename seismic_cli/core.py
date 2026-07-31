@@ -1,11 +1,17 @@
 """
 Shared RAM-transform and dataset-generation logic used by the `generate-dataset`
-CLI command. Baseline standardization is now a flag, not a separate script --
-`use_baseline_standardization=False` reproduces the original per-window
-self-standardization behavior exactly; `True` standardizes each channel
-against that station's own long-term noise statistics instead (falling back
-to self-standardization per-channel for any station without enough noise
-data to build a reliable baseline).
+CLI command. Baseline standardization is a flag, not a separate script --
+`use_baseline_standardization=False` reproduces per-window self-standardization;
+`True` standardizes each channel against that station's own long-term noise
+statistics instead (falling back to self-standardization per-channel for any
+station without enough noise data to build a reliable baseline).
+
+Split allocation is UNIFIED across classes: each station is assigned to exactly
+one of train/val/test, and both its earthquake and noise windows land in that
+same split. (Allocating the two classes independently let the same station sit
+in train for one class and test for the other -- with ~97% of earthquake
+stations also having noise data, that quietly broke the station-disjoint
+guarantee for nearly every station.)
 """
 
 import concurrent.futures
@@ -99,18 +105,77 @@ def clean_and_filter_1d(x: np.ndarray, fs: float, freqmin: float, freqmax: float
     return x
 
 
+# CHANNEL SELECTION
+
+# Preference order per component role. Sorting channel letters alphabetically
+# and taking the first three could grab e.g. ['1','2','E'] at a station with
+# mixed sensor codes -- two horizontals from one instrument plus one from
+# another, and no vertical at all. Selecting by explicit role keeps the
+# component->color mapping fixed (R=Z, G=N-ish, B=E-ish) for every station.
+_COMPONENT_ROLES = (('Z',), ('N', '1'), ('E', '2'))
+
+
+def select_components(available) -> Optional[Tuple[str, str, str]]:
+    """
+    Picks one channel letter per role (vertical, north-ish, east-ish) from the
+    available component letters. Returns (z, n, e) or None if any role has no
+    candidate -- a station without a usable vertical is skipped rather than
+    silently fed a horizontal in the Z slot.
+    """
+    available = set(available)
+    chosen = []
+    for candidates in _COMPONENT_ROLES:
+        for cand in candidates:
+            if cand in available:
+                chosen.append(cand)
+                break
+        else:
+            return None
+    return tuple(chosen)
+
+
+# WINDOWING
+
 def window_array(data: np.ndarray, fs: float = 100.0, window_seconds: float = 60.0, overlap: float = 0.5) -> List[np.ndarray]:
+    """Kept for backward compatibility; generation uses window_array_indexed."""
+    return [win for _, win in window_array_indexed(
+        data, np.zeros(data.shape, dtype=bool), fs=fs,
+        window_seconds=window_seconds, overlap=overlap, max_gap_fraction=1.0,
+    )[0]]
+
+
+def window_array_indexed(
+    data: np.ndarray,
+    gap_mask: np.ndarray,
+    fs: float,
+    window_seconds: float,
+    overlap: float,
+    max_gap_fraction: float = 0.05,
+) -> Tuple[List[Tuple[int, np.ndarray]], int]:
+    """
+    Slides fixed-length windows over `data` (n_samples, n_channels), returning
+    (original_window_index, window) pairs plus a count of windows rejected for
+    excessive gap content. The original index is what goes into the output
+    filename, so downstream reconstruction (eval-sta-lta) can always recover
+    the exact sample range regardless of which windows were kept.
+
+    gap_mask marks samples that were missing in the raw data and filled by
+    interpolation during merging. A window whose worst channel exceeds
+    `max_gap_fraction` of filled samples is rejected -- interpolated stretches
+    are synthetic, and a mostly-synthetic "noise" window is not noise.
+    """
     target_samples = int(fs * window_seconds)
     step_samples = int(target_samples * (1.0 - overlap))
     if step_samples < 1:
         raise ValueError("Overlap fraction too high; step size must be at least 1 sample.")
 
     n_samples = data.shape[0]
-    windows = []
+    windows: List[Tuple[int, np.ndarray]] = []
+    n_gap_rejected = 0
     tolerance = int(target_samples * 0.05)
 
     if n_samples < (target_samples - tolerance):
-        return windows
+        return windows, n_gap_rejected
 
     n_windows = math.ceil((n_samples - target_samples) / step_samples) + 1
     for i in range(n_windows):
@@ -118,13 +183,42 @@ def window_array(data: np.ndarray, fs: float = 100.0, window_seconds: float = 60
         end_idx = start_idx + target_samples
         win = data[start_idx:end_idx, :]
 
-        if len(win) >= (target_samples - tolerance):
-            if len(win) < target_samples:
-                pad_length = target_samples - len(win)
-                win = np.pad(win, ((0, pad_length), (0, 0)), mode='constant', constant_values=0)
-            windows.append(win)
+        if len(win) < (target_samples - tolerance):
+            continue
 
-    return windows
+        m = gap_mask[start_idx:end_idx, :]
+        if m.size and float(m.mean(axis=0).max()) > max_gap_fraction:
+            n_gap_rejected += 1
+            continue
+
+        if len(win) < target_samples:
+            pad_length = target_samples - len(win)
+            win = np.pad(win, ((0, pad_length), (0, 0)), mode='constant', constant_values=0)
+        windows.append((i, win))
+
+    return windows, n_gap_rejected
+
+
+def _masked_to_filled(tr_data) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Converts a (possibly masked) trace array into (filled_float64, gap_mask).
+    Gaps are filled by linear interpolation so downstream filtering has
+    contiguous data, but the mask records exactly which samples are synthetic
+    so windowing can reject gap-heavy windows instead of training on them.
+    """
+    if isinstance(tr_data, np.ma.MaskedArray):
+        mask = np.ma.getmaskarray(tr_data).copy()
+        x = tr_data.astype(np.float64).filled(np.nan)
+        if mask.any():
+            idx = np.arange(len(x))
+            good = ~mask
+            if good.sum() >= 2:
+                x[mask] = np.interp(idx[mask], idx[good], x[good])
+            else:
+                x[mask] = 0.0
+        return x, mask
+    x = np.asarray(tr_data, dtype=np.float64)
+    return x, np.zeros(len(x), dtype=bool)
 
 
 # --- STATION NOISE BASELINE COMPUTATION ---
@@ -224,29 +318,42 @@ def scan_single_mseed(args: Tuple[Path, float, float, float]) -> Tuple[Path, Dic
         print(f"\n[ERROR] Obspy failed to read {file_path.name}: {e}")
         return file_path, {}
 
-    actual_fs = st[0].stats.sampling_rate
-    target_samples = int(actual_fs * window_seconds)
-    tolerance_samples = int(target_samples * 0.05)
-    step_samples = int(target_samples * (1.0 - overlap))
-
-    stations = {}
+    # comp -> (max npts across segments, sampling rate), grouped per station.
+    # Each station's window count is computed with ITS OWN sampling rate --
+    # a file can legitimately contain stations at different rates, and using
+    # the first trace's rate for everyone mis-sizes every other station's
+    # windows.
+    stations: Dict[str, Dict[str, Tuple[int, float]]] = {}
     for tr in st:
         sta_key = f"{tr.stats.network}.{tr.stats.station}"
         chan = tr.stats.channel[-1].upper()
         if sta_key not in stations:
             stations[sta_key] = {}
-        current_len = stations[sta_key].get(chan, 0)
-        stations[sta_key][chan] = max(current_len, tr.stats.npts)
+        prev_npts, _ = stations[sta_key].get(chan, (0, tr.stats.sampling_rate))
+        stations[sta_key][chan] = (max(prev_npts, tr.stats.npts), tr.stats.sampling_rate)
 
     station_window_counts = {}
     for sta_key, channels in stations.items():
-        available_chans = sorted(channels.keys())
-        if len(available_chans) >= 3:
-            min_len = min(channels[ch] for ch in available_chans[:3])
-            if min_len >= (target_samples - tolerance_samples):
-                n_win = ((min_len - target_samples + tolerance_samples) // step_samples) + 1
-                if n_win > 0:
-                    station_window_counts[sta_key] = n_win
+        selection = select_components(channels.keys())
+        if selection is None:
+            continue
+
+        rates = {channels[c][1] for c in selection}
+        if len(rates) != 1:
+            continue  # inconsistent sampling rates across components
+        fs_station = rates.pop()
+
+        target_samples = int(fs_station * window_seconds)
+        tolerance_samples = int(target_samples * 0.05)
+        step_samples = int(target_samples * (1.0 - overlap))
+        if step_samples < 1:
+            continue
+
+        min_len = min(channels[c][0] for c in selection)
+        if min_len >= (target_samples - tolerance_samples):
+            n_win = ((min_len - target_samples + tolerance_samples) // step_samples) + 1
+            if n_win > 0:
+                station_window_counts[sta_key] = n_win
 
     return file_path, station_window_counts
 
@@ -255,95 +362,121 @@ def scan_single_mseed(args: Tuple[Path, float, float, float]) -> Tuple[Path, Dic
 
 def mseed_file_to_ram_rgb(
     file_path: Path,
-    station_assignments: Dict[str, Tuple[str, str, Path]],
+    station_assignments: Dict[str, Tuple[str, str, Path, Optional[int]]],
     station_baselines: Dict[Tuple[str, str], Tuple[float, float]],
     target_n: int,
     fs: float,
     window_seconds: float,
     overlap: float,
-) -> List[Tuple[str, str, str, str, str]]:
+    max_gap_fraction: float = 0.05,
+) -> List[Tuple[str, str, str, str, str, float]]:
     """
     Reads one mseed file ONCE and writes output only for the stations present
-    in `station_assignments`. If `station_baselines` is empty (plain mode),
-    every channel falls back to per-window self-standardization -- so this
-    single function correctly implements BOTH modes depending on what's
-    passed in, with no behavioral difference from the original plain script
-    when station_baselines={}.
+    in `station_assignments` (values: split, class, out_dir, window_quota).
+    If `station_baselines` is empty (plain mode), every channel falls back to
+    per-window self-standardization.
+
+    window_quota, when not None, caps how many windows this (file, station)
+    pair may emit; kept windows are chosen evenly spaced across the file but
+    keep their ORIGINAL window index in the filename, so manifest-driven
+    reconstruction still lands on the exact same samples.
     """
     st = read(str(file_path))
     try:
-        st.merge(method=1, fill_value='interpolate')
+        st.merge(method=1)  # no fill_value: gaps stay masked so we can see them
     except Exception as e:
         print(f"[WARN] Failed to merge traces in {file_path.name}: {e}")
         return []
 
-    actual_fs = st[0].stats.sampling_rate
-
-    stations = {}
+    # sta -> comp -> (filled_data, gap_mask, fs); keep the longest trace per
+    # component so a stray duplicate (e.g. second location code) can't
+    # silently replace the primary sensor.
+    stations: Dict[str, Dict[str, Tuple[np.ndarray, np.ndarray, float]]] = {}
     for tr in st:
         sta_key = f"{tr.stats.network}.{tr.stats.station}"
         if sta_key not in station_assignments:
             continue
-        if sta_key not in stations:
-            stations[sta_key] = {}
         chan = tr.stats.channel[-1].upper()
-        stations[sta_key][chan] = tr.data.astype(np.float64)
+        existing = stations.setdefault(sta_key, {}).get(chan)
+        if existing is not None and len(existing[0]) >= tr.stats.npts:
+            continue
+        data, gap_mask = _masked_to_filled(tr.data)
+        stations[sta_key][chan] = (data, gap_mask, tr.stats.sampling_rate)
 
-    target_samples = int(actual_fs * window_seconds)
-    tolerance_samples = int(target_samples * 0.05)
     file_id = file_path.stem
     manifest_rows = []
 
     for sta_key, channels in stations.items():
-        available_chans = sorted(channels.keys())
-        if len(available_chans) < 3:
+        selection = select_components(channels.keys())
+        if selection is None:
             continue
 
-        raw_channels = [channels[ch] for ch in available_chans[:3]]
+        rates = {channels[c][2] for c in selection}
+        if len(rates) != 1:
+            continue
+        fs_station = rates.pop()
+
+        target_samples = int(fs_station * window_seconds)
+        tolerance_samples = int(target_samples * 0.05)
+
+        raw_channels = [channels[c][0] for c in selection]
+        raw_masks = [channels[c][1] for c in selection]
         min_len = min(len(ch) for ch in raw_channels)
 
         if min_len < (target_samples - tolerance_samples):
             continue
 
-        trimmed_channels = [ch[:min_len] for ch in raw_channels]
-        event_data = np.column_stack(trimmed_channels)
+        event_data = np.column_stack([ch[:min_len] for ch in raw_channels])
+        gap_mask = np.column_stack([m[:min_len] for m in raw_masks])
 
-        windows = window_array(event_data, fs=actual_fs, window_seconds=window_seconds, overlap=overlap)
+        windows, _ = window_array_indexed(
+            event_data, gap_mask, fs=fs_station,
+            window_seconds=window_seconds, overlap=overlap,
+            max_gap_fraction=max_gap_fraction,
+        )
 
-        split_name, class_name, out_dir = station_assignments[sta_key]
+        split_name, class_name, out_dir, window_quota = station_assignments[sta_key]
 
-        for w_idx, win in enumerate(windows):
+        if window_quota is not None and len(windows) > window_quota:
+            sel_idx = np.linspace(0, len(windows) - 1, window_quota).round().astype(int)
+            windows = [windows[i] for i in sorted(set(sel_idx.tolist()))]
+
+        comp_z, comp_n, comp_e = selection
+
+        for w_idx, win in windows:
             cleaned_win = np.zeros_like(win, dtype=np.float64)
             for i in range(win.shape[1]):
-                cleaned_win[:, i] = clean_and_filter_1d(win[:, i], actual_fs, 1.0, 45.0)
+                cleaned_win[:, i] = clean_and_filter_1d(win[:, i], fs_station, 1.0, 45.0)
 
-            comp_0, comp_1, comp_2 = available_chans[0], available_chans[1], available_chans[2]
-            mu0, sigma0 = station_baselines.get((sta_key, comp_0), (None, None))
-            mu1, sigma1 = station_baselines.get((sta_key, comp_1), (None, None))
-            mu2, sigma2 = station_baselines.get((sta_key, comp_2), (None, None))
+            mu_z, sigma_z = station_baselines.get((sta_key, comp_z), (None, None))
+            mu_n, sigma_n = station_baselines.get((sta_key, comp_n), (None, None))
+            mu_e, sigma_e = station_baselines.get((sta_key, comp_e), (None, None))
 
-            ram_B_mat, _ = ram_matrix(cleaned_win[:, 0], target_n=target_n, mu=mu0, sigma=sigma0)
-            ram_G_mat, _ = ram_matrix(cleaned_win[:, 1], target_n=target_n, mu=mu1, sigma=sigma1)
-            ram_R_mat, _ = ram_matrix(cleaned_win[:, 2], target_n=target_n, mu=mu2, sigma=sigma2)
+            # Columns follow `selection` order: 0=Z, 1=N-ish, 2=E-ish.
+            ram_Z_mat, _ = ram_matrix(cleaned_win[:, 0], target_n=target_n, mu=mu_z, sigma=sigma_z)
+            ram_N_mat, _ = ram_matrix(cleaned_win[:, 1], target_n=target_n, mu=mu_n, sigma=sigma_n)
+            ram_E_mat, _ = ram_matrix(cleaned_win[:, 2], target_n=target_n, mu=mu_e, sigma=sigma_e)
 
-            ram_B = to_uint8(ram_B_mat)
-            ram_G = to_uint8(ram_G_mat)
-            ram_R = to_uint8(ram_R_mat)
-
-            rgb = np.stack([ram_R, ram_G, ram_B], axis=-1)
+            # R=Z, G=N-ish, B=E-ish -- same mapping the previous sorted-channel
+            # code produced for E/N/Z stations, now explicit and uniform for
+            # 1/2-named stations too.
+            rgb = np.stack([to_uint8(ram_Z_mat), to_uint8(ram_N_mat), to_uint8(ram_E_mat)], axis=-1)
             img = Image.fromarray(rgb, mode="RGB")
 
             filename = f"{file_id}_{sta_key}_win{w_idx:03d}.png"
             img.save(out_dir / filename)
-            manifest_rows.append((split_name, class_name, sta_key, str(file_path), filename))
+            manifest_rows.append((split_name, class_name, sta_key, str(file_path), filename, fs_station))
 
     return manifest_rows
 
 
 def _process_task(args):
-    file_path, station_assignments, station_baselines, target_n, fs, window_seconds, overlap = args
+    file_path, station_assignments, station_baselines, target_n, fs, window_seconds, overlap, max_gap_fraction = args
     try:
-        return mseed_file_to_ram_rgb(file_path, station_assignments, station_baselines, target_n, fs, window_seconds, overlap)
+        return mseed_file_to_ram_rgb(
+            file_path, station_assignments, station_baselines, target_n, fs,
+            window_seconds, overlap, max_gap_fraction=max_gap_fraction,
+        )
     except Exception as e:
         return f"[WARN] Failed file {file_path.stem}: {e}"
 
@@ -354,39 +487,44 @@ def _cap_station_windows(
     valid_source_info: List[Tuple[str, int, List[Tuple[Path, int]]]],
     max_windows_per_station: Optional[int],
     rng: random.Random,
-) -> List[Tuple[str, int, List[Tuple[Path, int]]]]:
-    if max_windows_per_station is None:
-        return valid_source_info
-
+) -> List[Tuple[str, int, List[Tuple[Path, int, Optional[int]]]]]:
+    """
+    Applies the per-station window cap by assigning each kept file a window
+    QUOTA (None = keep all) instead of dropping whole files. The old
+    file-granularity version couldn't cap below a single file's window count:
+    one 300s noise file at 3s windows yields ~200 windows, so a cap of 20
+    silently passed all ~200 through. Quotas are enforced at generation time
+    by evenly subsampling each file's windows.
+    """
     capped = []
     for station_key, total_windows, file_contribs in valid_source_info:
-        if total_windows <= max_windows_per_station:
-            capped.append((station_key, total_windows, file_contribs))
+        if max_windows_per_station is None or total_windows <= max_windows_per_station:
+            capped.append((station_key, total_windows,
+                           [(fpath, w, None) for fpath, w in file_contribs]))
             continue
 
         shuffled = list(file_contribs)
         rng.shuffle(shuffled)
 
         kept = []
-        running_total = 0
+        remaining = max_windows_per_station
         for fpath, w_count in shuffled:
-            if running_total + w_count > max_windows_per_station and kept:
-                continue
-            kept.append((fpath, w_count))
-            running_total += w_count
-            if running_total >= max_windows_per_station:
+            if remaining <= 0:
                 break
+            take = min(w_count, remaining)
+            kept.append((fpath, w_count, take))
+            remaining -= take
 
-        capped.append((station_key, running_total, kept))
+        capped.append((station_key, max_windows_per_station - remaining, kept))
 
     return capped
 
 
-def _write_split_manifest(manifest_path: Path, entries: List[Tuple[str, str, str, str, str]]) -> None:
+def _write_split_manifest(manifest_path: Path, entries: List[Tuple[str, str, str, str, str, float]]) -> None:
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     with open(manifest_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['split', 'class_name', 'station_key', 'file_path', 'filename'])
+        writer.writerow(['split', 'class_name', 'station_key', 'file_path', 'filename', 'fs'])
         writer.writerows(entries)
 
 
@@ -406,6 +544,7 @@ def run_balanced_preprocessing(
     freqmax: float = 45.0,
     min_baseline_seconds: float = 60.0,
     num_cores: Optional[int] = None,
+    max_gap_fraction: float = 0.05,
 ):
     print("=" * 60)
     mode_label = "baseline-standardized" if use_baseline_standardization else "plain per-window standardization"
@@ -413,7 +552,8 @@ def run_balanced_preprocessing(
     print("=" * 60)
     if max_windows_per_station is not None:
         print(f"[INFO] Capping any single station's contribution to at most "
-              f"{max_windows_per_station} windows across all its event files.")
+              f"{max_windows_per_station} windows across all its event files "
+              f"(enforced per-window, not per-file).")
 
     if use_baseline_standardization:
         station_baselines, _ = compute_station_noise_baselines(
@@ -423,6 +563,7 @@ def run_balanced_preprocessing(
         station_baselines = {}
 
     classes = [("01_earthquake", Path(eq_dir)), ("00_noise", Path(noise_dir))]
+    class_names = [name for name, _ in classes]
     out_paths = {}
 
     for class_name, _ in classes:
@@ -515,58 +656,74 @@ def run_balanced_preprocessing(
     print(f"  -> Bottleneck dictates a maximum of {bottleneck_size} images per class.")
     print(f"  -> Final target set to {target_per_class} images per class (Total: {target_per_class * 2} images).")
 
-    print("\n[PHASE 3] Allocating STATION-disjoint splits...")
+    print("\n[PHASE 3] Allocating STATION-disjoint splits (unified across classes)...")
 
-    file_to_assignments: Dict[Path, Dict[str, Tuple[str, str, Path]]] = {}
+    # sta -> class -> (window_total, file_contribs)
+    per_station: Dict[str, Dict[str, Tuple[int, List[Tuple[Path, int, Optional[int]]]]]] = {}
+    for class_name in class_names:
+        for sta_key, w_total, contribs in class_data[class_name]["valid_sources"]:
+            per_station.setdefault(sta_key, {})[class_name] = (w_total, contribs)
 
+    splits = ["train", "val", "test"]
+    targets = {}
+    for class_name in class_names:
+        t_train = int(target_per_class * split_ratios[0])
+        t_val = int(target_per_class * split_ratios[1])
+        targets[class_name] = {"train": t_train, "val": t_val,
+                                "test": target_per_class - t_train - t_val}
+    counts = {c: {s: 0 for s in splits} for c in class_names}
+    n_stations = {c: {s: 0 for s in splits} for c in class_names}
+
+    all_stations = sorted(per_station.keys())
     random.seed(42)
+    random.shuffle(all_stations)
 
-    for class_name, _ in classes:
-        target_train = int(target_per_class * split_ratios[0])
-        target_val = int(target_per_class * split_ratios[1])
-        target_test = target_per_class - target_train - target_val
+    file_to_assignments: Dict[Path, Dict[str, Tuple[str, str, Path, Optional[int]]]] = {}
 
-        stations = list(class_data[class_name]["valid_sources"])
-        random.shuffle(stations)
+    for sta_key in all_stations:
+        present_classes = list(per_station[sta_key].keys())
 
-        count_train = count_val = count_test = 0
-        n_stations_train = n_stations_val = n_stations_test = 0
-
-        for sta_key, w_count, file_contribs in stations:
-            if target_train > 0 and count_train < target_train:
-                split_name = "train"
-                count_train += w_count
-                n_stations_train += 1
-            elif target_val > 0 and count_val < target_val:
-                split_name = "val"
-                count_val += w_count
-                n_stations_val += 1
-            elif target_test > 0 and count_test < target_test:
-                split_name = "test"
-                count_test += w_count
-                n_stations_test += 1
-            else:
+        # One split per STATION, shared by every class it appears in. This is
+        # the actual station-disjoint guarantee: a station assigned to train
+        # can never surface in val/test under either label.
+        split_name = None
+        for cand in splits:
+            if any(counts[c][cand] < targets[c][cand] for c in present_classes):
+                split_name = cand
                 break
+        if split_name is None:
+            continue  # every split this station could help is already full
 
+        for class_name in present_classes:
+            w_total, contribs = per_station[sta_key][class_name]
+            counts[class_name][split_name] += w_total
+            n_stations[class_name][split_name] += 1
             out_dir = out_paths[class_name][split_name]
+            for fpath, _w_count, quota in contribs:
+                file_to_assignments.setdefault(fpath, {})[sta_key] = (split_name, class_name, out_dir, quota)
 
-            for fpath, _ in file_contribs:
-                file_to_assignments.setdefault(fpath, {})[sta_key] = (split_name, class_name, out_dir)
+        if all(counts[c][s] >= targets[c][s] for c in class_names for s in splits):
+            break
 
+    for class_name in class_names:
+        t = targets[class_name]
+        c = counts[class_name]
+        ns = n_stations[class_name]
         print(f"  -> {class_name.upper()}:")
-        print(f"     Target windows | Train: {target_train:<6} | Val: {target_val:<6} | Test: {target_test:<6}")
-        print(f"     Actual windows | Train: {count_train:<6} | Val: {count_val:<6} | Test: {count_test:<6}")
-        print(f"     Stations used  | Train: {n_stations_train:<6} | Val: {n_stations_val:<6} | Test: {n_stations_test:<6}")
+        print(f"     Target windows | Train: {t['train']:<6} | Val: {t['val']:<6} | Test: {t['test']:<6}")
+        print(f"     Actual windows | Train: {c['train']:<6} | Val: {c['val']:<6} | Test: {c['test']:<6}")
+        print(f"     Stations used  | Train: {ns['train']:<6} | Val: {ns['val']:<6} | Test: {ns['test']:<6}")
+    print("     [INFO] Every station occupies exactly one split across BOTH classes.")
 
     tasks = [
-        (fpath, assignments, station_baselines, target_n, fs, window_seconds, overlap)
+        (fpath, assignments, station_baselines, target_n, fs, window_seconds, overlap, max_gap_fraction)
         for fpath, assignments in file_to_assignments.items()
     ]
 
     print(f"\n[PHASE 4] Processing {len(tasks)} file-level tasks "
           f"(each file read once, only assigned stations written) on {num_cores} cores...")
 
-    full_manifest: List[Tuple[str, str, str, str, str]] = []
+    full_manifest: List[Tuple[str, str, str, str, str, float]] = []
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores) as executor:
         for result in executor.map(_process_task, tasks):
             if isinstance(result, str):

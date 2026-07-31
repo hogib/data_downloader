@@ -12,10 +12,13 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+import scipy.signal
 from obspy import read
 from obspy.signal.trigger import classic_sta_lta
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                              roc_auc_score, roc_curve)
+
+from seismic_cli.core import select_components
 
 FILENAME_RE = re.compile(r"_win(\d+)\.png$")
 
@@ -42,19 +45,24 @@ def get_window_from_mseed(
         print(f"  [SKIP] Could not open '{file_path}': {e}")
         return None
 
+    # Keep the longest trace per component, mirroring generation, so a stray
+    # duplicate channel can't shift which data gets reconstructed.
     channels = {}
     for tr in st:
         sta_key = f"{tr.stats.network}.{tr.stats.station}"
         if sta_key != station_key:
             continue
         chan = tr.stats.channel[-1].upper()
+        existing = channels.get(chan)
+        if existing is not None and len(existing) >= len(tr.data):
+            continue
         channels[chan] = tr.data.astype(np.float64)
 
-    available_chans = sorted(channels.keys())
-    if len(available_chans) < 3:
+    selection = select_components(channels.keys())
+    if selection is None:
         return None
 
-    raw_channels = [channels[ch] for ch in available_chans[:3]]
+    raw_channels = [channels[ch] for ch in selection]
     min_len = min(len(ch) for ch in raw_channels)
     event_data = np.column_stack([ch[:min_len] for ch in raw_channels])
 
@@ -85,6 +93,11 @@ def sta_lta_score(waveform: np.ndarray, fs: float, sta_sec: float, lta_sec: floa
         if len(trace) <= nlta:
             continue
         try:
+            # Raw MiniSEED counts carry large DC offsets; classic STA/LTA
+            # works on signal energy, so an un-detrended trace with a big
+            # offset has its ratio pinned near 1 regardless of content --
+            # silently crippling the baseline at exactly those stations.
+            trace = scipy.signal.detrend(trace, type='linear')
             cft = classic_sta_lta(trace, nsta, nlta)
             ratio = np.nanmax(cft) if len(cft) else 0.0
         except Exception:
@@ -111,6 +124,12 @@ def run_eval_sta_lta(
     print(f"[info] {len(df)} '{split}' entries "
           f"({(df['label'] == 1).sum()} earthquake, {(df['label'] == 0).sum()} noise)")
 
+    has_fs_column = "fs" in df.columns
+    if has_fs_column:
+        print("[info] Manifest records per-station sampling rates; using them for reconstruction.")
+    else:
+        print(f"[info] Older manifest without an 'fs' column; assuming {fs} Hz for every entry.")
+
     if len(df) > 0:
         sample_path = Path(df.iloc[0]["file_path"])
         print(f"[check] Sample file_path from manifest: {sample_path}")
@@ -136,15 +155,19 @@ def run_eval_sta_lta(
             n_skipped += 1
             continue
 
+        row_fs = fs
+        if has_fs_column and pd.notna(row["fs"]):
+            row_fs = float(row["fs"])
+
         win = get_window_from_mseed(
             row["file_path"], row["station_key"], window_index,
-            fs=fs, window_seconds=window_seconds, overlap=overlap,
+            fs=row_fs, window_seconds=window_seconds, overlap=overlap,
         )
         if win is None:
             n_skipped += 1
             continue
 
-        score = sta_lta_score(win, fs=fs, sta_sec=sta_seconds, lta_sec=lta_seconds)
+        score = sta_lta_score(win, fs=row_fs, sta_sec=sta_seconds, lta_sec=lta_seconds)
         scores.append(score)
         labels.append(row["label"])
 
@@ -176,6 +199,9 @@ def run_eval_sta_lta(
     print(f"STA/LTA Accuracy:  {acc:.4f}")
     print(f"STA/LTA Precision: {prec:.4f}")
     print(f"STA/LTA Recall:    {rec:.4f}")
+    print("[note] The threshold above is selected ON THIS SPLIT (oracle), which "
+          "flatters STA/LTA's accuracy/precision/recall. Compare models via AUC; "
+          "treat these thresholded numbers as STA/LTA's upper bound.")
 
     print("\nComputed on the EXACT test windows (same file + station + window index) "
           "the CNN was evaluated on.")

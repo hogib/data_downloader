@@ -284,6 +284,18 @@ def download_all_concurrent(
         )
         df_collision_check = df
 
+    # Drop catalog rows whose date failed to parse (ParsedUTC is None).
+    # Comparing None against a UTCDateTime raises inside the pandas
+    # element-wise comparison, and that exception is swallowed by the
+    # per-event error handler -- so a single bad date row would silently
+    # fail EVERY event's noise contamination check.
+    n_unparseable = df_collision_check["ParsedUTC"].isna().sum()
+    if n_unparseable > 0:
+        print(f"[warning] {n_unparseable} catalog row(s) have unparseable dates and are "
+              f"excluded from collision detection -- events near those times cannot be "
+              f"checked for contamination.")
+        df_collision_check = df_collision_check[df_collision_check["ParsedUTC"].notna()].copy()
+
     if file_limit is not None and file_limit > 0:
         df_process = df.head(file_limit)
         print(

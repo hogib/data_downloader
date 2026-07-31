@@ -11,8 +11,64 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import scipy.signal
 from obspy import Stream, read
 from obspy.signal.trigger import classic_sta_lta, trigger_onset
+
+
+def select_pick_traces(traces: list) -> list:
+    """
+    Priority-ordered candidates for the STA/LTA arrival pick: vertical (Z)
+    first (P-wave onsets are cleanest there), then the remaining channels
+    alphabetically, so a station with a dead/flat Z can still pick on a
+    horizontal channel instead of being dropped entirely.
+    """
+    z_traces = [tr for tr in traces if tr.stats.channel[-1].upper() == 'Z']
+    other_traces = sorted(
+        (tr for tr in traces if tr.stats.channel[-1].upper() != 'Z'),
+        key=lambda t: t.stats.channel,
+    )
+    return z_traces + other_traces
+
+
+def pick_arrival_with_cft(
+    trace_data: np.ndarray,
+    fs: float,
+    pick_sta_seconds: float,
+    pick_lta_seconds: float,
+    trigger_on: float,
+    trigger_off: float,
+) -> Tuple[Optional[int], float]:
+    """
+    Coarse arrival pick using classic STA/LTA + trigger_onset over the full
+    (long) buffer. Returns (arrival_sample, max_cft): arrival_sample is None
+    if nothing triggers, and max_cft is the highest STA/LTA ratio reached,
+    so the caller can report how close failed stations came to triggering.
+    """
+    nsta = max(1, int(pick_sta_seconds * fs))
+    nlta = max(nsta + 1, int(pick_lta_seconds * fs))
+
+    if len(trace_data) <= nlta:
+        return None, 0.0
+
+    try:
+        # Raw MiniSEED counts carry large DC offsets and drift; classic
+        # STA/LTA works on signal energy, so a big offset pins the ratio
+        # near 1 and nothing ever crosses trigger_on. Detrend a copy for
+        # picking only -- the sliced output windows stay raw, since the
+        # downstream pipeline does its own cleaning/filtering.
+        x = scipy.signal.detrend(np.asarray(trace_data, dtype=np.float64), type='linear')
+        cft = classic_sta_lta(x, nsta, nlta)
+        onsets = trigger_onset(cft, trigger_on, trigger_off)
+    except Exception:
+        return None, 0.0
+
+    max_cft = float(np.max(cft)) if len(cft) else 0.0
+
+    if len(onsets) == 0:
+        return None, max_cft
+
+    return int(onsets[0][0]), max_cft
 
 
 def pick_arrival_sample(
@@ -23,27 +79,10 @@ def pick_arrival_sample(
     trigger_on: float,
     trigger_off: float,
 ) -> Optional[int]:
-    """
-    Coarse arrival pick using classic STA/LTA + trigger_onset over the full
-    (long) buffer. Returns None if nothing triggers -- better to skip than
-    to anchor on a bad guess.
-    """
-    nsta = max(1, int(pick_sta_seconds * fs))
-    nlta = max(nsta + 1, int(pick_lta_seconds * fs))
-
-    if len(trace_data) <= nlta:
-        return None
-
-    try:
-        cft = classic_sta_lta(trace_data, nsta, nlta)
-        onsets = trigger_onset(cft, trigger_on, trigger_off)
-    except Exception:
-        return None
-
-    if len(onsets) == 0:
-        return None
-
-    return int(onsets[0][0])
+    """Backward-compatible wrapper around pick_arrival_with_cft."""
+    return pick_arrival_with_cft(
+        trace_data, fs, pick_sta_seconds, pick_lta_seconds, trigger_on, trigger_off,
+    )[0]
 
 
 def slice_anchored_window(
@@ -67,11 +106,6 @@ def slice_anchored_window(
 
     return trace_data[start_idx:start_idx + target_samples]
 
-def select_pick_trace(traces: list):
-    z_traces = [tr for tr in traces if tr.stats.channel[-1].upper() == 'Z']
-    if z_traces:
-        return z_traces[0]
-    return sorted(traces, key=lambda t: t.stats.channel)[0]
 
 def process_one_event_file(
     source_path: Path,
@@ -82,7 +116,12 @@ def process_one_event_file(
     trigger_on: float,
     trigger_off: float,
     pre_arrival_fraction: float,
+    stats: Optional[dict] = None,
 ) -> List[Tuple[str, Path, Stream]]:
+    def bump(key: str, amount: int = 1):
+        if stats is not None:
+            stats[key] = stats.get(key, 0) + amount
+
     try:
         st = read(str(source_path))
         st.merge(method=1, fill_value='interpolate')
@@ -98,18 +137,32 @@ def process_one_event_file(
         stations.setdefault(sta_key, []).append(tr)
 
     for sta_key, traces in stations.items():
+        bump('stations_seen')
         if len(traces) < 3:
+            bump('stations_lt3_channels')
             continue
 
         fs = traces[0].stats.sampling_rate
-        pick_trace = select_pick_trace(traces)
-        arrival_sample = pick_arrival_sample(
-            pick_trace.data.astype(np.float64), fs,
-            pick_sta_seconds, pick_lta_seconds, trigger_on, trigger_off,
-        )
+        arrival_sample = None
+        picked_component = None
+        best_cft = 0.0
+        for pick_trace in select_pick_traces(traces):
+            arrival_sample, max_cft = pick_arrival_with_cft(
+                pick_trace.data.astype(np.float64), fs,
+                pick_sta_seconds, pick_lta_seconds, trigger_on, trigger_off,
+            )
+            best_cft = max(best_cft, max_cft)
+            if arrival_sample is not None:
+                picked_component = pick_trace.stats.channel[-1].upper()
+                break
 
         if arrival_sample is None:
+            bump('stations_no_pick')
+            if stats is not None:
+                stats.setdefault('failed_best_cfts', []).append(best_cft)
             continue
+
+        bump('picked_on_z' if picked_component == 'Z' else 'picked_on_fallback')
 
         for target_dir_name, window_seconds in target_windows:
             sliced_traces = []
@@ -172,6 +225,7 @@ def run_anchor_windows(
     counts = {name: 0 for name, _ in target_windows}
     n_files_processed = 0
     n_files_no_pick = 0
+    stats: dict = {}
 
     for i, src_path in enumerate(source_files, 1):
         if i % 200 == 0:
@@ -180,6 +234,7 @@ def run_anchor_windows(
         outputs = process_one_event_file(
             src_path, output_base, target_windows,
             pick_sta_seconds, pick_lta_seconds, trigger_on, trigger_off, pre_arrival_fraction,
+            stats=stats,
         )
         if not outputs:
             n_files_no_pick += 1
@@ -198,3 +253,17 @@ def run_anchor_windows(
           f"({n_files_no_pick} had no station with a reliable arrival pick).")
     for name, count in counts.items():
         print(f"  -> {name}: {count} anchored event files written to {output_base / name}")
+
+    print("\n[PICK DIAGNOSTICS]")
+    print(f"  stations seen:             {stats.get('stations_seen', 0)}")
+    print(f"  skipped (<3 channels):     {stats.get('stations_lt3_channels', 0)}")
+    print(f"  picked on Z:               {stats.get('picked_on_z', 0)}")
+    print(f"  picked on fallback chan:   {stats.get('picked_on_fallback', 0)}")
+    print(f"  no pick on any channel:    {stats.get('stations_no_pick', 0)}")
+    failed_cfts = stats.get('failed_best_cfts', [])
+    if failed_cfts:
+        print(f"  failed stations' best STA/LTA ratio: "
+              f"median {np.median(failed_cfts):.2f}, max {np.max(failed_cfts):.2f} "
+              f"(trigger_on={trigger_on})")
+        print(f"  -> if these cluster just below {trigger_on}, lower trigger_on; "
+              f"if they sit near 1.0, the pick data is effectively flat.")
