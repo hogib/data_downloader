@@ -23,8 +23,8 @@ from typing import List, Optional
 
 import typer
 
-from seismic_cli import anchor, eval_baseline, spectrogram
-from seismic_cli.core import run_balanced_preprocessing
+from seismic_cli import anchor, eval_baseline, regression, spectrogram
+from seismic_cli.core import RamImageEncoder, run_balanced_preprocessing
 
 app = typer.Typer(help="Seismic RAM-image / CNN earthquake detection pipeline.")
 
@@ -184,6 +184,67 @@ def generate_spectrogram_dataset_cmd(
         limit_pictures=limit_pictures, max_windows_per_station=max_windows_per_station,
         freqmin=freqmin, freqmax=freqmax, num_cores=num_cores,
         generate_max=generate_max, encoder=encoder,
+    )
+
+
+@app.command("generate-regression-dataset")
+def generate_regression_dataset_cmd(
+    eq_dir: str = typer.Option(..., help="Directory of earthquake mseed files."),
+    noise_dir: str = typer.Option(..., help="Noise mseed directory (used for the amplitude reference)."),
+    catalog_path: str = typer.Option(..., help="Event catalog CSV with EventID + Magnitude (+ Latitude/Longitude)."),
+    output_dir: str = typer.Option(..., help="Where to write tensors + manifest.csv."),
+    station_catalog: Optional[str] = typer.Option(
+        None, help="Optional station CSV (network/station/latitude/longitude) enabling distance_km."),
+    encoding: str = typer.Option("spectrogram", help="spectrogram (.pt tensors) or ram (.png images)."),
+    window_seconds: float = typer.Option(60.0, help="Window length in seconds."),
+    overlap: float = typer.Option(0.5, help="Sliding-window overlap fraction."),
+    split_by: str = typer.Option(
+        "event", help="event = keep whole events together (default; the magnitude label is per-event, "
+                      "so a shared event leaks the target directly). station = station-disjoint instead."),
+    n_fft: int = typer.Option(256, help="FFT size (spectrogram encoding)."),
+    top_db: float = typer.Option(80.0, help="Dynamic-range clamp (spectrogram encoding)."),
+    normalize: str = typer.Option("station", help="Spectrogram normalization; see generate-spectrogram-dataset."),
+    target_n: int = typer.Option(64, help="RAM image resolution (ram encoding)."),
+    train_ratio: float = typer.Option(0.70),
+    val_ratio: float = typer.Option(0.15),
+    test_ratio: float = typer.Option(0.15),
+    max_windows_per_station: Optional[int] = typer.Option(None, help="Per-window cap on any single station."),
+    freqmin: float = typer.Option(1.0, help="Bandpass low corner (Hz)."),
+    freqmax: float = typer.Option(45.0, help="Bandpass high corner (Hz)."),
+    fs: float = typer.Option(100.0, help="Nominal sampling rate."),
+    seed: int = typer.Option(42),
+    num_cores: Optional[int] = typer.Option(None),
+):
+    """
+    Builds a magnitude-labelled dataset from earthquake mseed: encoded windows
+    plus, per window, the source magnitude and the two physical predictors it
+    depends on (log SNR against the station's noise floor, and epicentral
+    distance). Splits keep whole events together by default, since the label
+    is per-event.
+    """
+    if encoding == "spectrogram":
+        profiles = {}
+        if normalize == "station":
+            profiles = spectrogram.compute_station_spectral_baselines(
+                noise_dir, n_fft=n_fft, top_db=top_db, nominal_fs=fs,
+                freqmin=freqmin, freqmax=freqmax,
+            )
+        encoder = spectrogram.SpectrogramEncoder(
+            n_fft=n_fft, top_db=top_db, nominal_fs=fs, window_seconds=window_seconds,
+            normalize=normalize, noise_profiles=profiles,
+        )
+    elif encoding == "ram":
+        encoder = RamImageEncoder(target_n)
+    else:
+        raise typer.BadParameter("--encoding must be 'spectrogram' or 'ram'")
+
+    regression.run_regression_preprocessing(
+        eq_dir=eq_dir, noise_dir=noise_dir, catalog_path=catalog_path,
+        output_dir=output_dir, encoder=encoder, station_catalog=station_catalog,
+        split_ratios=(train_ratio, val_ratio, test_ratio), fs=fs,
+        window_seconds=window_seconds, overlap=overlap,
+        max_windows_per_station=max_windows_per_station, split_by=split_by,
+        freqmin=freqmin, freqmax=freqmax, num_cores=num_cores, seed=seed,
     )
 
 
