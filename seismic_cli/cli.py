@@ -23,7 +23,8 @@ from typing import List, Optional
 
 import typer
 
-from seismic_cli import anchor, eval_baseline, regression, spectrogram
+from seismic_cli import (anchor, catalog, eval_baseline, regression,
+                         spectrogram)
 from seismic_cli.core import RamImageEncoder, run_balanced_preprocessing
 
 app = typer.Typer(help="Seismic RAM-image / CNN earthquake detection pipeline.")
@@ -245,6 +246,56 @@ def generate_regression_dataset_cmd(
         window_seconds=window_seconds, overlap=overlap,
         max_windows_per_station=max_windows_per_station, split_by=split_by,
         freqmin=freqmin, freqmax=freqmax, num_cores=num_cores, seed=seed,
+    )
+
+
+@app.command("generate-catalog-dataset")
+def generate_catalog_dataset_cmd(
+    catalog_path: str = typer.Option(..., help="Earthquake catalog CSV (AFAD/Kandilli export)."),
+    output_dir: str = typer.Option(..., help="Where to write window tensors + manifest.csv."),
+    window_events: int = typer.Option(64, help="Events per sliding window (fixed length)."),
+    stride_events: int = typer.Option(8, help="Events advanced between consecutive windows."),
+    major_magnitude: float = typer.Option(6.0, help="Magnitude defining a 'major' earthquake."),
+    min_magnitude: float = typer.Option(2.0, help="Drop catalog events below this magnitude."),
+    target_n: int = typer.Option(32, help="RAM image resolution for the 2D channel."),
+    lat_min: Optional[float] = typer.Option(None), lat_max: Optional[float] = typer.Option(None),
+    lon_min: Optional[float] = typer.Option(None), lon_max: Optional[float] = typer.Option(None),
+    center_lat: Optional[float] = typer.Option(None), center_lon: Optional[float] = typer.Option(None),
+    radius_km: Optional[float] = typer.Option(None, help="Alternative to a bbox."),
+    split_mode: str = typer.Option(
+        "chronological", help="chronological (default, the only valid choice for forecasting) "
+                              "or random (leaky; for quantifying the leak only)."),
+    embargo_days: Optional[float] = typer.Option(
+        None, help="Gap between splits. Defaults to the full label horizon, so no training "
+                   "window's label can reference an event inside the test period."),
+    max_horizon_days: float = typer.Option(3650.0, help="Discard windows whose next major event is further out."),
+    class_lo_days: Optional[float] = typer.Option(None, help="Lower risk-class boundary in days. Default: auto from train terciles."),
+    class_hi_days: Optional[float] = typer.Option(None, help="Upper risk-class boundary in days. Default: auto from train terciles."),
+    train_ratio: float = typer.Option(0.70), val_ratio: float = typer.Option(0.15),
+    test_ratio: float = typer.Option(0.15),
+    seed: int = typer.Option(42),
+):
+    """
+    Builds sliding-window training data from an earthquake catalog for the
+    dual-channel CNN+LSTM risk model: a per-event feature sequence (1D
+    channel), a RAM image of it (2D channel), window-level physical scalars
+    including b-value and largest Lyapunov exponent, and a time-to-next-major
+    label. Splits are chronological with an embargo, because this is a
+    forecasting task.
+    """
+    bbox = None
+    if None not in (lat_min, lat_max, lon_min, lon_max):
+        bbox = (lat_min, lat_max, lon_min, lon_max)
+    center = (center_lat, center_lon) if None not in (center_lat, center_lon) else None
+    catalog.run_catalog_dataset(
+        catalog_path=catalog_path, output_dir=output_dir, window_events=window_events,
+        stride_events=stride_events, major_magnitude=major_magnitude,
+        min_magnitude=min_magnitude, target_n=target_n, bbox=bbox, center=center,
+        radius_km=radius_km, split_mode=split_mode,
+        ratios=(train_ratio, val_ratio, test_ratio), embargo_days=embargo_days,
+        max_horizon_days=max_horizon_days, seed=seed,
+        class_boundaries=((class_lo_days, class_hi_days)
+                          if None not in (class_lo_days, class_hi_days) else None),
     )
 
 
