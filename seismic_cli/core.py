@@ -360,15 +360,49 @@ def scan_single_mseed(args: Tuple[Path, float, float, float]) -> Tuple[Path, Dic
 
 # PROCESSING LOGIC
 
-def mseed_file_to_ram_rgb(
+class RamImageEncoder:
+    """
+    Default per-window encoder: 3-channel RAM image (R=Z, G=N-ish, B=E-ish).
+
+    Encoders are the pluggable step of the pipeline -- everything around them
+    (station-disjoint splits, per-window caps, gap rejection, per-station
+    sampling rates, manifest) is shared, so a new representation cannot drift
+    away from those guarantees the way parallel copies of this pipeline did.
+    """
+    ext = ".png"
+
+    def __init__(self, target_n: int = 64):
+        self.target_n = target_n
+
+    def __call__(self, cleaned_win, fs_station, sta_key, selection,
+                 station_baselines, out_dir, stem):
+        comp_z, comp_n, comp_e = selection
+        mu_z, sigma_z = station_baselines.get((sta_key, comp_z), (None, None))
+        mu_n, sigma_n = station_baselines.get((sta_key, comp_n), (None, None))
+        mu_e, sigma_e = station_baselines.get((sta_key, comp_e), (None, None))
+
+        # Columns follow `selection` order: 0=Z, 1=N-ish, 2=E-ish.
+        ram_Z, _ = ram_matrix(cleaned_win[:, 0], target_n=self.target_n, mu=mu_z, sigma=sigma_z)
+        ram_N, _ = ram_matrix(cleaned_win[:, 1], target_n=self.target_n, mu=mu_n, sigma=sigma_n)
+        ram_E, _ = ram_matrix(cleaned_win[:, 2], target_n=self.target_n, mu=mu_e, sigma=sigma_e)
+
+        rgb = np.stack([to_uint8(ram_Z), to_uint8(ram_N), to_uint8(ram_E)], axis=-1)
+        filename = stem + self.ext
+        Image.fromarray(rgb, mode="RGB").save(out_dir / filename)
+        return filename
+
+
+def mseed_file_to_dataset(
     file_path: Path,
     station_assignments: Dict[str, Tuple[str, str, Path, Optional[int]]],
     station_baselines: Dict[Tuple[str, str], Tuple[float, float]],
-    target_n: int,
+    encoder,
     fs: float,
     window_seconds: float,
     overlap: float,
     max_gap_fraction: float = 0.05,
+    freqmin: float = 1.0,
+    freqmax: float = 45.0,
 ) -> List[Tuple[str, str, str, str, str, float]]:
     """
     Reads one mseed file ONCE and writes output only for the stations present
@@ -441,41 +475,36 @@ def mseed_file_to_ram_rgb(
             sel_idx = np.linspace(0, len(windows) - 1, window_quota).round().astype(int)
             windows = [windows[i] for i in sorted(set(sel_idx.tolist()))]
 
-        comp_z, comp_n, comp_e = selection
-
         for w_idx, win in windows:
             cleaned_win = np.zeros_like(win, dtype=np.float64)
             for i in range(win.shape[1]):
-                cleaned_win[:, i] = clean_and_filter_1d(win[:, i], fs_station, 1.0, 45.0)
+                cleaned_win[:, i] = clean_and_filter_1d(win[:, i], fs_station, freqmin, freqmax)
 
-            mu_z, sigma_z = station_baselines.get((sta_key, comp_z), (None, None))
-            mu_n, sigma_n = station_baselines.get((sta_key, comp_n), (None, None))
-            mu_e, sigma_e = station_baselines.get((sta_key, comp_e), (None, None))
-
-            # Columns follow `selection` order: 0=Z, 1=N-ish, 2=E-ish.
-            ram_Z_mat, _ = ram_matrix(cleaned_win[:, 0], target_n=target_n, mu=mu_z, sigma=sigma_z)
-            ram_N_mat, _ = ram_matrix(cleaned_win[:, 1], target_n=target_n, mu=mu_n, sigma=sigma_n)
-            ram_E_mat, _ = ram_matrix(cleaned_win[:, 2], target_n=target_n, mu=mu_e, sigma=sigma_e)
-
-            # R=Z, G=N-ish, B=E-ish -- same mapping the previous sorted-channel
-            # code produced for E/N/Z stations, now explicit and uniform for
-            # 1/2-named stations too.
-            rgb = np.stack([to_uint8(ram_Z_mat), to_uint8(ram_N_mat), to_uint8(ram_E_mat)], axis=-1)
-            img = Image.fromarray(rgb, mode="RGB")
-
-            filename = f"{file_id}_{sta_key}_win{w_idx:03d}.png"
-            img.save(out_dir / filename)
+            stem = f"{file_id}_{sta_key}_win{w_idx:03d}"
+            filename = encoder(cleaned_win, fs_station, sta_key, selection,
+                               station_baselines, out_dir, stem)
             manifest_rows.append((split_name, class_name, sta_key, str(file_path), filename, fs_station))
 
     return manifest_rows
 
 
+# Backwards-compatible alias for the RAM-specific entry point.
+def mseed_file_to_ram_rgb(file_path, station_assignments, station_baselines,
+                          target_n, fs, window_seconds, overlap, max_gap_fraction=0.05):
+    return mseed_file_to_dataset(
+        file_path, station_assignments, station_baselines, RamImageEncoder(target_n),
+        fs, window_seconds, overlap, max_gap_fraction=max_gap_fraction,
+    )
+
+
 def _process_task(args):
-    file_path, station_assignments, station_baselines, target_n, fs, window_seconds, overlap, max_gap_fraction = args
+    (file_path, station_assignments, station_baselines, encoder, fs,
+     window_seconds, overlap, max_gap_fraction, freqmin, freqmax) = args
     try:
-        return mseed_file_to_ram_rgb(
-            file_path, station_assignments, station_baselines, target_n, fs,
+        return mseed_file_to_dataset(
+            file_path, station_assignments, station_baselines, encoder, fs,
             window_seconds, overlap, max_gap_fraction=max_gap_fraction,
+            freqmin=freqmin, freqmax=freqmax,
         )
     except Exception as e:
         return f"[WARN] Failed file {file_path.stem}: {e}"
@@ -546,7 +575,10 @@ def run_balanced_preprocessing(
     num_cores: Optional[int] = None,
     max_gap_fraction: float = 0.05,
     generate_max: bool = False,
+    encoder=None,
 ):
+    if encoder is None:
+        encoder = RamImageEncoder(target_n)
     if generate_max and limit_pictures:
         raise ValueError("generate_max and limit_pictures are mutually exclusive: "
                          "--max means 'as many images as the data allows'.")
@@ -814,15 +846,24 @@ def run_balanced_preprocessing(
     print("     [INFO] Every station occupies exactly one split across BOTH classes.")
 
     tasks = [
-        (fpath, assignments, station_baselines, target_n, fs, window_seconds, overlap, max_gap_fraction)
+        (fpath, assignments, station_baselines, encoder, fs, window_seconds,
+         overlap, max_gap_fraction, freqmin, freqmax)
         for fpath, assignments in file_to_assignments.items()
     ]
 
     print(f"\n[PHASE 4] Processing {len(tasks)} file-level tasks "
           f"(each file read once, only assigned stations written) on {num_cores} cores...")
 
+    # Encoders that pull in torch must run under 'spawn': torch's threading /
+    # OpenMP state does not survive fork(), and the workers deadlock silently
+    # (sleeping at 0% CPU, no output, forever) instead of erroring out.
+    mp_context = None
+    if getattr(encoder, "requires_spawn", False):
+        mp_context = multiprocessing.get_context("spawn")
+        print("       (using 'spawn' workers -- required for torch-based encoders)")
+
     full_manifest: List[Tuple[str, str, str, str, str, float]] = []
-    with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores, mp_context=mp_context) as executor:
         for result in executor.map(_process_task, tasks):
             if isinstance(result, str):
                 print(result)

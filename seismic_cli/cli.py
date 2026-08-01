@@ -23,7 +23,7 @@ from typing import List, Optional
 
 import typer
 
-from seismic_cli import anchor, eval_baseline
+from seismic_cli import anchor, eval_baseline, spectrogram
 from seismic_cli.core import run_balanced_preprocessing
 
 app = typer.Typer(help="Seismic RAM-image / CNN earthquake detection pipeline.")
@@ -122,6 +122,68 @@ def generate_dataset_cmd(
         min_baseline_seconds=min_baseline_seconds,
         num_cores=num_cores,
         generate_max=generate_max,
+    )
+
+
+@app.command("generate-spectrogram-dataset")
+def generate_spectrogram_dataset_cmd(
+    eq_dir: str = typer.Option(..., help="Directory of earthquake mseed files."),
+    noise_dir: str = typer.Option(..., help="Directory of noise mseed files."),
+    output_dir: str = typer.Option(..., help="Where to write the dataset (train/val/test + manifest.csv)."),
+    window_seconds: float = typer.Option(60.0, help="Window length in seconds."),
+    overlap: float = typer.Option(0.5, help="Overlap fraction for sliding windows."),
+    n_fft: int = typer.Option(256, help="FFT size; frequency bins = n_fft//2 + 1."),
+    hop_length: Optional[int] = typer.Option(None, help="STFT hop. Default n_fft//4."),
+    top_db: float = typer.Option(80.0, help="Dynamic-range clamp for the dB conversion."),
+    normalize: str = typer.Option(
+        "station", help="station = subtract the station's median noise dB profile per frequency bin "
+                        "(cancels instrument gain, KEEPS amplitude above noise -- the signal RAM discards); "
+                        "per_window = z-score each window (drops absolute amplitude too); "
+                        "none = raw dB (leaks instrument gain)."),
+    train_ratio: float = typer.Option(0.70),
+    val_ratio: float = typer.Option(0.15),
+    test_ratio: float = typer.Option(0.15),
+    limit_pictures: Optional[int] = typer.Option(None, help="Cap total tensors. Mutually exclusive with --max."),
+    generate_max: bool = typer.Option(False, "--max", help="Generate the maximum balanced dataset."),
+    max_windows_per_station: Optional[int] = typer.Option(None, help="Per-window cap on any single station."),
+    freqmin: float = typer.Option(1.0, help="Bandpass low corner (Hz)."),
+    freqmax: float = typer.Option(45.0, help="Bandpass high corner (Hz)."),
+    fs: float = typer.Option(100.0, help="Nominal sampling rate; every window is resampled to this "
+                                          "so all tensors share one shape."),
+    num_cores: Optional[int] = typer.Option(None, help="Worker processes (default: cpu_count - 1)."),
+):
+    """
+    Generates a station-disjoint, balanced dataset of 3-channel log-power
+    spectrogram tensors (.pt), with the same guarantees as generate-dataset:
+    unified station splits, per-window caps, gap rejection, per-station
+    sampling rates, and a manifest for exact-window STA/LTA comparison.
+    """
+    if generate_max and limit_pictures:
+        raise typer.BadParameter("--max and --limit-pictures are mutually exclusive.")
+    if normalize not in spectrogram.NORMALIZE_MODES:
+        raise typer.BadParameter(f"--normalize must be one of {spectrogram.NORMALIZE_MODES}")
+
+    profiles = {}
+    if normalize == "station":
+        profiles = spectrogram.compute_station_spectral_baselines(
+            noise_dir, n_fft=n_fft, hop_length=hop_length, top_db=top_db,
+            nominal_fs=fs, freqmin=freqmin, freqmax=freqmax,
+        )
+        if not profiles:
+            print("[WARN] No spectral baselines built; every window falls back to per-window "
+                  "normalization (instrument gain is removed, absolute amplitude is not preserved).")
+
+    encoder = spectrogram.SpectrogramEncoder(
+        n_fft=n_fft, hop_length=hop_length, top_db=top_db, nominal_fs=fs,
+        window_seconds=window_seconds, normalize=normalize, noise_profiles=profiles,
+    )
+    run_balanced_preprocessing(
+        eq_dir=eq_dir, noise_dir=noise_dir, output_dir=output_dir,
+        split_ratios=(train_ratio, val_ratio, test_ratio),
+        fs=fs, window_seconds=window_seconds, overlap=overlap,
+        limit_pictures=limit_pictures, max_windows_per_station=max_windows_per_station,
+        freqmin=freqmin, freqmax=freqmax, num_cores=num_cores,
+        generate_max=generate_max, encoder=encoder,
     )
 
 
