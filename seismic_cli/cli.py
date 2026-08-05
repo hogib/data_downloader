@@ -369,6 +369,68 @@ def generate_dual_dataset_cmd(
     )
 
 
+@app.command("generate-dual-aux-dataset")
+def generate_dual_aux_dataset_cmd(
+    eq_dir: str = typer.Option(..., help="Directory of earthquake mseed files."),
+    noise_dir: str = typer.Option(..., help="Directory of noise mseed files (also used for the "
+                                             "station noise baseline log_snr is measured against)."),
+    output_dir: str = typer.Option(..., help="Where to write the dataset (train/val/test + manifest.csv)."),
+    window_seconds: float = typer.Option(60.0, help="Window length in seconds."),
+    overlap: float = typer.Option(0.5, help="Overlap fraction for sliding windows."),
+    target_n: int = typer.Option(64, help="RAM image resolution (n x n)."),
+    fs: float = typer.Option(100.0, help="Nominal sampling rate; every window is resampled to this "
+                                          "so all seq tensors share one shape. Also sets the 1D "
+                                          "branch's sequence length (fs * window_seconds) -- self-"
+                                          "attention there is O(m^2), so long windows at high fs "
+                                          "may need a smaller --batch-size when training."),
+    train_ratio: float = typer.Option(0.70),
+    val_ratio: float = typer.Option(0.15),
+    test_ratio: float = typer.Option(0.15),
+    limit_pictures: Optional[int] = typer.Option(None, help="Cap total tensors. Mutually exclusive with --max."),
+    generate_max: bool = typer.Option(False, "--max", help="Generate the maximum balanced dataset."),
+    max_windows_per_station: Optional[int] = typer.Option(None, help="Per-window cap on any single station."),
+    baseline: bool = typer.Option(
+        False, "--baseline/--no-baseline",
+        help="Standardize the seq/img branches against that station's long-term noise "
+             "baseline instead of the window's own statistics. Independent of the aux "
+             "branch's log_snr, which always needs a station baseline and is computed "
+             "regardless of this flag."),
+    freqmin: float = typer.Option(1.0, help="Bandpass low corner (Hz)."),
+    freqmax: float = typer.Option(45.0, help="Bandpass high corner (Hz)."),
+    min_baseline_seconds: float = typer.Option(60.0, help="Minimum seconds of usable noise data "
+                                                            "required before trusting a station's baseline."),
+    num_cores: Optional[int] = typer.Option(None, help="Worker processes (default: cpu_count - 1)."),
+):
+    """
+    generate-dual-dataset plus a log_snr/log_rms aux vector -- tests whether
+    the amplitude fix that helped the plain RAM classifier (test AUC 0.836 ->
+    0.923, see cnn_ram_aux.py) also helps once the RAM image is one branch of
+    the dual-channel model rather than the whole classifier. See
+    seismic_cli/ram_dual.py's RamDualAuxEncoder. Train with cnn_earthquake's
+    cnn_lstm_classify_aux.py.
+    """
+    if generate_max and limit_pictures:
+        raise typer.BadParameter("--max and --limit-pictures are mutually exclusive.")
+
+    aux_baselines, _ = compute_station_noise_baselines(
+        noise_dir, fs=fs, freqmin=freqmin, freqmax=freqmax, min_baseline_seconds=min_baseline_seconds,
+    )
+    if not aux_baselines:
+        print("[WARN] No station noise baselines built; log_snr will default to 0.0 for every window.")
+
+    encoder = ram_dual.RamDualAuxEncoder(target_n=target_n, nominal_fs=fs, window_seconds=window_seconds,
+                                         aux_baselines=aux_baselines)
+    run_balanced_preprocessing(
+        eq_dir=eq_dir, noise_dir=noise_dir, output_dir=output_dir,
+        split_ratios=(train_ratio, val_ratio, test_ratio),
+        target_n=target_n, fs=fs, window_seconds=window_seconds, overlap=overlap,
+        limit_pictures=limit_pictures, max_windows_per_station=max_windows_per_station,
+        use_baseline_standardization=baseline, freqmin=freqmin, freqmax=freqmax,
+        min_baseline_seconds=min_baseline_seconds, num_cores=num_cores,
+        generate_max=generate_max, encoder=encoder,
+    )
+
+
 @app.command("generate-regression-dataset")
 def generate_regression_dataset_cmd(
     eq_dir: str = typer.Option(..., help="Directory of earthquake mseed files."),

@@ -106,3 +106,60 @@ class RamDualEncoder:
         filename = stem + self.ext
         torch.save({"seq": torch.from_numpy(seq), "img": torch.from_numpy(img)}, out_dir / filename)
         return filename
+
+
+class RamDualAuxEncoder(RamDualEncoder):
+    """
+    `RamDualEncoder` plus the same [log_snr, log_rms] aux vector
+    `ram_aux.RamAuxEncoder` adds to the plain RAM classifier -- for testing
+    whether that fix also helps once the RAM image is one branch of the
+    dual-channel model rather than the whole classifier. The 2D branch alone
+    is still exactly as scale-invariant as ever (report.md 8.2); this gives
+    the model a direct route to the amplitude information it discards,
+    regardless of how much the 1D raw-waveform branch already compensates.
+
+    `aux_baselines` is separate from the `station_baselines` argument
+    `__call__` receives from the pipeline (which is controlled by `--baseline`
+    and only populated when that flag is set) -- log_snr needs a noise
+    baseline unconditionally, so it is baked in at construction like
+    `RamAuxEncoder` does, independent of whether seq/img also use one.
+    """
+
+    def __init__(self, target_n: int = 64, nominal_fs: float = 100.0, window_seconds: float = 60.0,
+                aux_baselines: Optional[Dict[Tuple[str, str], Tuple[float, float]]] = None):
+        super().__init__(target_n=target_n, nominal_fs=nominal_fs, window_seconds=window_seconds)
+        self.aux_baselines = aux_baselines or {}
+
+    def __call__(self, cleaned_win, fs_station, sta_key, selection,
+                 station_baselines: Dict[Tuple[str, str], Tuple[Optional[float], Optional[float]]],
+                 out_dir, stem):
+        import torch
+
+        comp_z, comp_n, comp_e = selection
+        x = _fit_length(_resample_to(cleaned_win, fs_station, self.nominal_fs),
+                        self.target_samples())
+
+        seqs, imgs, snrs, rmss = [], [], [], []
+        for i, comp in enumerate((comp_z, comp_n, comp_e)):
+            mu, sigma = station_baselines.get((sta_key, comp), (None, None))
+            seqs.append(standardize(x[:, i], mu=mu, sigma=sigma))
+            R, _ = ram_matrix(x[:, i], target_n=self.target_n, mu=mu, sigma=sigma)
+            imgs.append((np.clip(R, -np.pi, np.pi) + np.pi) / (2 * np.pi))
+
+            sigma_win = float(np.std(cleaned_win[:, i]))
+            if sigma_win > 0:
+                rmss.append(math.log(sigma_win))
+                _mu, sigma_noise = self.aux_baselines.get((sta_key, comp), (None, None))
+                if sigma_noise and sigma_noise > 0:
+                    snrs.append(math.log(sigma_win / sigma_noise))
+
+        seq = np.stack(seqs, axis=-1).astype(np.float32)
+        img = np.stack(imgs, axis=0).astype(np.float32)
+        log_snr = float(np.mean(snrs)) if snrs else 0.0
+        log_rms = float(np.mean(rmss)) if rmss else 0.0
+        aux = np.array([log_snr, log_rms], dtype=np.float32)
+
+        filename = stem + self.ext
+        torch.save({"seq": torch.from_numpy(seq), "img": torch.from_numpy(img),
+                    "aux": torch.from_numpy(aux)}, out_dir / filename)
+        return filename
