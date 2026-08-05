@@ -222,18 +222,23 @@ def gardner_knopoff_windows(mag: float) -> Tuple[float, float]:
 def decluster_gardner_knopoff(df: pd.DataFrame) -> np.ndarray:
     """
     Flags independent mainshocks, largest magnitude first: any smaller event
-    falling inside a claimed mainshock's Gardner-Knopoff space-time window is
-    marked as that mainshock's aftershock and excluded from future claims.
+    falling inside a claimed mainshock's Gardner-Knopoff space-time window --
+    on EITHER side of it in time -- is marked dependent (aftershock if after,
+    foreshock if before) and excluded from future claims.
 
     Returns a boolean mask over `df` (True = independent mainshock).
 
-    This matters only for TARGET selection -- aftershocks stay in the catalog
-    as window FEATURES (they are real seismicity). Without this, a single
-    mainshock's aftershock sequence masquerades as many independent "targets",
-    which both inflates the apparent sample size and collapses the label
-    horizon onto Omori-decay timescales (days-weeks) instead of tectonic
-    recurrence (years) -- exactly what happened on a real run where 8 of 31
-    "targets" turned out to be one M6.2's own aftershocks dated the same day.
+    This matters only for TARGET selection -- dependent events stay in the
+    catalog as window FEATURES (they are real seismicity). Without it, a
+    single mainshock's aftershock sequence masquerades as many independent
+    "targets", which both inflates the apparent sample size and collapses the
+    label horizon onto Omori-decay timescales (days-weeks) instead of
+    tectonic recurrence (years) -- exactly what happened on a real run where
+    8 of 31 "targets" turned out to be one M6.2's own aftershocks dated the
+    same day. The window is applied symmetrically in time (not just after,
+    per the strict 1974 formulation) so that a foreshock hours or days ahead
+    of a mainshock -- e.g. an M4.3 the same day as a nearby M4.8 -- is also
+    absorbed rather than counted as its own independent target.
     """
     n = len(df)
     is_main = np.ones(n, dtype=bool)
@@ -245,18 +250,18 @@ def decluster_gardner_knopoff(df: pd.DataFrame) -> np.ndarray:
 
     for i in order:
         if not is_main[i]:
-            continue                        # already claimed as someone else's aftershock
+            continue                        # already claimed as someone else's dependent event
         l_km, t_days = gardner_knopoff_windows(mag[i])
         dt_days = (t - t[i]) / np.timedelta64(1, "D")
         d_km = haversine_km(lat, lon, lat[i], lon[i])
-        # Same-magnitude ties and same-day catalogs put candidates at dt == 0,
-        # so this must be >= 0, not > 0, or those events escape declustering
-        # entirely; dt < 0 (earlier, larger events) already excluded them above.
-        # mag <= mag[i] additionally stops a small foreshock a few minutes
-        # ahead of a much bigger mainshock from "claiming" the mainshock as
-        # ITS aftershock -- caught on real data where an M3.9 36 minutes
-        # before the M6.2 Marmara/Silivri mainshock was demoting the M6.2.
-        cand = is_main & (dt_days >= 0) & (dt_days <= t_days) & (d_km <= l_km) & (mag <= mag[i])
+        # abs(dt_days) so foreshocks (dt < 0) are claimed too, not just
+        # aftershocks (dt > 0); dt == 0 (same-timestamp/same-day ties in a
+        # date-only catalog) must also be included or those escape entirely.
+        # mag <= mag[i] stops a smaller event -- before OR after the larger
+        # one -- from claiming the larger event as ITS dependent; caught on
+        # real data where an M3.9 36 minutes before the M6.2 Marmara/Silivri
+        # mainshock was demoting the M6.2 itself.
+        cand = is_main & (np.abs(dt_days) <= t_days) & (d_km <= l_km) & (mag <= mag[i])
         cand[i] = False                     # never claim the mainshock itself
         is_main[cand] = False
 
@@ -323,7 +328,7 @@ def report_major_events(df: pd.DataFrame, major_magnitude: float,
 
 def build_windows(df: pd.DataFrame, window_events: int, stride_events: int,
                   major_magnitude: float, max_horizon_days: float = 3650.0,
-                  target_mask: Optional[np.ndarray] = None
+                  target_mask: Optional[np.ndarray] = None, region_label: str = "default"
                   ) -> List[dict]:
     """
     Slides a fixed-EVENT-COUNT window along the catalog.
@@ -413,12 +418,65 @@ def build_windows(df: pd.DataFrame, window_events: int, stride_events: int,
             "start_time": pd.Timestamp(wt[0]),
             "target_time": pd.Timestamp(nxt[0]),   # the major event this window is labelled by
             "days_to_major": days,
+            "region": region_label,
             "seq": seq,
             "aux": aux,
         })
 
     print(f"[windows] {len(out)} windows of {window_events} events (stride {stride_events})")
     return out
+
+
+# ---------------------------------------------------------------------------
+# Multi-region pooling
+# ---------------------------------------------------------------------------
+
+def pool_regions(df: pd.DataFrame, regions: Sequence[Tuple[float, float, float, float]],
+                 window_events: int, stride_events: int, major_magnitude: float,
+                 max_horizon_days: float = 3650.0, decluster: bool = True,
+                 region_names: Optional[Sequence[str]] = None) -> List[dict]:
+    """
+    Builds windows independently per region and pools them.
+
+    Windows are built PER REGION, not on the union of events, because a
+    sliding window is a local sequence -- pooling raw events first and then
+    sliding chronologically across the union would interleave, in one
+    window, events from unrelated fault systems on opposite ends of the
+    country that only appear adjacent because of a shared timestamp
+    ordering. Declustering is also run separately per region for the same
+    reason: a Gardner-Knopoff window is only ever tens to a couple hundred
+    km wide, so regions far enough apart never interact anyway, but running
+    it per region keeps the reported target counts attributable to a place.
+
+    This is the fix for the sample-size ceiling found on a single-region
+    (Marmara-only) run: one fault zone has too few independent M>=4 events
+    for a chronological split or any real evaluation to be stable. Pooling
+    several zones raises the number of distinct target EVENTS (the real
+    sample size), not just the number of windows.
+    """
+    names = list(region_names) if region_names else [f"region{i+1}" for i in range(len(regions))]
+    all_windows: List[dict] = []
+    print(f"\n[pool] {len(regions)} region(s) requested")
+    for name, bbox in zip(names, regions):
+        print(f"\n--- {name}: bbox {bbox} ---")
+        rdf = filter_region(df, bbox=bbox)
+        if len(rdf) < window_events * 2:
+            print(f"[SKIP] {name}: only {len(rdf)} events after filtering, need at least "
+                  f"{window_events * 2}.")
+            continue
+        target_mask = decluster_gardner_knopoff(rdf) if decluster else None
+        n_targets = report_major_events(rdf, major_magnitude, max_horizon_days, target_mask=target_mask)
+        if n_targets == 0:
+            print(f"[SKIP] {name}: no target events, nothing to slide windows toward.")
+            continue
+        rw = build_windows(rdf, window_events, stride_events, major_magnitude,
+                           max_horizon_days=max_horizon_days, target_mask=target_mask,
+                           region_label=name)
+        all_windows.extend(rw)
+
+    print(f"\n[pool] {len(all_windows)} total windows across {len(regions)} region(s), "
+          f"{len({(w['region'], w['target_time']) for w in all_windows})} distinct target events")
+    return all_windows
 
 
 # ---------------------------------------------------------------------------
@@ -483,7 +541,7 @@ def chronological_split(windows: List[dict], ratios=(0.70, 0.15, 0.15),
     # Effective sample size is the number of distinct target events, not windows.
     print("        distinct target (major) events per split -- the real sample size:")
     for s in ("train", "val", "test"):
-        n_ev = len({w["target_time"] for w in parts[s]})
+        n_ev = len({(w["region"], w["target_time"]) for w in parts[s]})
         print(f"          {s:5s}: {n_ev} event(s) across {len(parts[s])} windows")
         if 0 < n_ev < 3:
             print(f"                 [!] {n_ev} distinct event(s) -- every window in this split "
@@ -512,7 +570,8 @@ def random_split(windows: List[dict], ratios=(0.70, 0.15, 0.15), seed: int = 42)
 # ---------------------------------------------------------------------------
 
 def assign_risk_classes(parts: Dict[str, List[dict]],
-                        boundaries: Optional[Sequence[float]] = None) -> Sequence[float]:
+                        boundaries: Optional[Sequence[float]] = None,
+                        boundary_split: str = "train") -> Sequence[float]:
     """
     Turns `days_to_major` into the 3 risk classes.
 
@@ -521,17 +580,19 @@ def assign_risk_classes(parts: Dict[str, List[dict]],
     since a single region rarely has enough M>=6 events to train on -- and
     recurrence collapses to months, putting every window in `lt_1y` and making
     the task vacuous. `boundaries=None` therefore derives cut points from the
-    TRAINING split's tercile days, giving three roughly equal classes at
-    whatever timescale the chosen threshold actually implies. Train-only
-    derivation keeps the test distribution out of the class definition.
+    `boundary_split` split's tercile days (normally "train"; for a flat/LOEO
+    dataset there is no train/val/test distinction at write time, so the
+    caller passes "all" instead -- documented there as an approximation,
+    since strict train-only derivation isn't well-defined until the CV folds
+    are formed at training time).
     """
     if boundaries is None:
-        days = np.array([w["days_to_major"] for w in parts["train"]], dtype=np.float64)
+        days = np.array([w["days_to_major"] for w in parts[boundary_split]], dtype=np.float64)
         if len(days) < 3:
             boundaries = (365.0, 1825.0)
         else:
             boundaries = tuple(np.quantile(days, [1 / 3, 2 / 3]))
-        print(f"[classes] boundaries auto-derived from train terciles: "
+        print(f"[classes] boundaries auto-derived from '{boundary_split}' terciles: "
               f"< {boundaries[0]:.0f} d  |  {boundaries[0]:.0f}-{boundaries[1]:.0f} d  |  "
               f"> {boundaries[1]:.0f} d")
     else:
@@ -539,7 +600,9 @@ def assign_risk_classes(parts: Dict[str, List[dict]],
               f"{boundaries[0]:.0f}-{boundaries[1]:.0f} d  |  > {boundaries[1]:.0f} d")
 
     lo, hi = float(boundaries[0]), float(boundaries[1])
-    for split in ("train", "val", "test"):
+    for split in parts:
+        if split.startswith("_"):
+            continue
         for w in parts[split]:
             d = w["days_to_major"]
             w["risk_class"] = RISK_CLASSES[0] if d < lo else (
@@ -555,8 +618,9 @@ def encode_and_write(parts: Dict[str, List[dict]], output_dir: str, target_n: in
     from seismic_cli.core import ram_matrix, to_uint8
 
     root = Path(output_dir)
+    split_names = [s for s in parts if not s.startswith("_")]
     rows = []
-    for split in ("train", "val", "test"):
+    for split in split_names:
         d = root / split
         d.mkdir(parents=True, exist_ok=True)
         for i, w in enumerate(parts[split]):
@@ -576,23 +640,25 @@ def encode_and_write(parts: Dict[str, List[dict]], output_dir: str, target_n: in
             torch.save({"seq": torch.from_numpy(seq),
                         "img": torch.from_numpy(img),
                         "aux": torch.from_numpy(aux)}, d / name)
-            rows.append((split, name, w["start_time"], w["end_time"],
+            rows.append((split, name, w.get("region", "default"), w["target_time"],
+                         w["start_time"], w["end_time"],
                          w["days_to_major"], w["risk_class"],
                          *[w["aux"][k] for k in AUX_FEATURES]))
 
     mpath = root / "manifest.csv"
     with open(mpath, "w", newline="") as f:
         wr = csv.writer(f)
-        wr.writerow(["split", "filename", "start_time", "end_time",
+        wr.writerow(["split", "filename", "region", "target_time", "start_time", "end_time",
                      "days_to_major", "risk_class", *AUX_FEATURES])
         wr.writerows(rows)
 
-    df = pd.DataFrame(rows, columns=["split", "filename", "start_time", "end_time",
-                                     "days_to_major", "risk_class", *AUX_FEATURES])
+    df = pd.DataFrame(rows, columns=["split", "filename", "region", "target_time",
+                                     "start_time", "end_time", "days_to_major", "risk_class",
+                                     *AUX_FEATURES])
     print(f"\n[write] {len(df)} windows -> {mpath}")
     print(f"        seq {seq.shape}  img {img.shape}  aux ({len(AUX_FEATURES)},)")
     print("\n  Class balance per split (this is what the baseline must beat):")
-    for split in ("train", "val", "test"):
+    for split in split_names:
         sub = df[df.split == split]
         if sub.empty:
             print(f"     {split:5s}: EMPTY")
@@ -600,7 +666,9 @@ def encode_and_write(parts: Dict[str, List[dict]], output_dir: str, target_n: in
         counts = sub.risk_class.value_counts()
         major = counts.max() / len(sub)
         dist = "  ".join(f"{c}={counts.get(c,0)}" for c in RISK_CLASSES)
-        print(f"     {split:5s}: n={len(sub):5d}  {dist}   majority={major:.3f}")
+        n_ev = sub[["region", "target_time"]].drop_duplicates().shape[0]
+        print(f"     {split:5s}: n={len(sub):5d}  {dist}   majority={major:.3f}   "
+              f"({n_ev} distinct target events)")
     print("\n  [!] A model must beat the TEST majority-class rate above to mean anything."
           "\n      IP4's 70% target is reachable by predicting one class if that rate is high.")
     n_lyap = int(df.lyapunov.notna().sum())
@@ -612,47 +680,84 @@ def run_catalog_dataset(catalog_path: str, output_dir: str, window_events: int =
                         stride_events: int = 8, major_magnitude: float = 6.0,
                         min_magnitude: Optional[float] = 2.0, target_n: int = 32,
                         bbox=None, center=None, radius_km=None,
+                        regions: Optional[Sequence[Tuple[float, float, float, float]]] = None,
+                        region_names: Optional[Sequence[str]] = None,
                         split_mode: str = "chronological", ratios=(0.70, 0.15, 0.15),
                         embargo_days: Optional[float] = None,
                         max_horizon_days: float = 3650.0, seed: int = 42,
                         class_boundaries: Optional[Sequence[float]] = None,
                         decluster: bool = True) -> None:
+    """
+    `regions`, when given, pools independently-windowed sliding windows from
+    several fault zones (see `pool_regions`) instead of a single bbox/center.
+    `split_mode="loeo"` skips the chronological split entirely and writes
+    every window into a single "all" split; use `cnn_lstm_loeo.py` on the
+    result to run leave-one-event-out cross-validation, which is the more
+    honest evaluation once there are enough pooled target events that a
+    single chronological cut is no longer the bottleneck.
+    """
     print("=" * 64)
     print("CATALOG SLIDING-WINDOW DATASET (time-to-major-earthquake)")
     print("=" * 64)
     df = load_catalog(catalog_path, min_magnitude=min_magnitude)
-    df = filter_region(df, bbox=bbox, center=center, radius_km=radius_km)
-    if len(df) < window_events * 2:
-        print(f"[ERROR] Only {len(df)} events after filtering; need at least "
-              f"{window_events * 2} for a usable dataset.")
-        return
 
-    target_mask = None
-    if decluster:
-        target_mask = decluster_gardner_knopoff(df)
+    if regions:
+        windows = pool_regions(df, regions, window_events, stride_events, major_magnitude,
+                               max_horizon_days=max_horizon_days, decluster=decluster,
+                               region_names=region_names)
     else:
-        print("[decluster] disabled (--no-decluster) -- aftershock sequences may appear "
-              "as multiple independent targets.")
+        rdf = filter_region(df, bbox=bbox, center=center, radius_km=radius_km)
+        if len(rdf) < window_events * 2:
+            print(f"[ERROR] Only {len(rdf)} events after filtering; need at least "
+                  f"{window_events * 2} for a usable dataset.")
+            return
+        target_mask = None
+        if decluster:
+            target_mask = decluster_gardner_knopoff(rdf)
+        else:
+            print("[decluster] disabled (--no-decluster) -- aftershock sequences may appear "
+                  "as multiple independent targets.")
+        report_major_events(rdf, major_magnitude, max_horizon_days, target_mask=target_mask)
+        windows = build_windows(rdf, window_events, stride_events, major_magnitude,
+                                max_horizon_days=max_horizon_days, target_mask=target_mask)
 
-    report_major_events(df, major_magnitude, max_horizon_days, target_mask=target_mask)
-    windows = build_windows(df, window_events, stride_events, major_magnitude,
-                            max_horizon_days=max_horizon_days, target_mask=target_mask)
     if not windows:
         print("[ERROR] No usable windows.")
         return
+
+    n_targets = len({(w["region"], w["target_time"]) for w in windows})
+
+    if split_mode == "loeo":
+        # No train/val/test split here -- every window goes into one "all"
+        # bucket, and `cnn_lstm_loeo.py` forms the folds (one per distinct
+        # target event) at training time. Boundaries come from the whole
+        # pool rather than a "train" split, since that split doesn't exist
+        # yet; see the docstring on `assign_risk_classes`.
+        if n_targets < 5:
+            print(f"\n[ERROR] Only {n_targets} distinct target event(s) -- leave-one-event-out "
+                  f"CV needs several folds to say anything. Pool more regions, lower "
+                  f"--major-magnitude, or extend the catalog. Nothing was written.")
+            return
+        parts = {"all": windows}
+        assign_risk_classes(parts, class_boundaries, boundary_split="all")
+        encode_and_write(parts, output_dir, target_n=target_n)
+        print(f"\n[COMPLETE] Flat dataset ready for leave-one-event-out CV "
+              f"({n_targets} target events -> up to {n_targets} folds).")
+        return
+
     parts = (chronological_split(windows, ratios, embargo_days, max_horizon_days)
              if split_mode == "chronological" else random_split(windows, ratios, seed))
 
     if not parts["train"] or not parts["test"]:
         empty = [s for s in ("train", "val", "test") if not parts[s]]
-        n_targets = len({w["target_time"] for w in windows})
         print(f"\n[ERROR] Split(s) {empty} came out empty, so no model can be trained.")
         print(f"        The {len(windows)} windows point at only {n_targets} distinct target "
               f"event(s).")
         print("        With too few targets, every early window is labelled by an event in a")
         print("        later split and is correctly dropped as leakage -- which empties train.")
         print("        This is a property of the region/threshold, not a fixable split rule:")
-        print("        lower --major-magnitude, widen the region, or extend the catalog.")
+        print("        lower --major-magnitude, widen the region, extend the catalog, or use")
+        print("        --split-mode loeo, which does not require a single chronological cut.")
         print("        Nothing was written.")
         return
 

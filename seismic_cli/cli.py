@@ -262,9 +262,21 @@ def generate_catalog_dataset_cmd(
     lon_min: Optional[float] = typer.Option(None), lon_max: Optional[float] = typer.Option(None),
     center_lat: Optional[float] = typer.Option(None), center_lon: Optional[float] = typer.Option(None),
     radius_km: Optional[float] = typer.Option(None, help="Alternative to a bbox."),
+    region: List[str] = typer.Option(
+        [], "--region", "-r",
+        help="Pool an additional fault zone: 'lat_min,lat_max,lon_min,lon_max'. Repeatable. "
+             "Windows are built independently per region (so a window never mixes events from "
+             "unrelated fault systems) and then pooled, raising the count of distinct target "
+             "events beyond what any single zone supports. Overrides --lat-min/etc. when given; "
+             "combine with --split-mode loeo to actually make use of the extra targets."),
     split_mode: str = typer.Option(
-        "chronological", help="chronological (default, the only valid choice for forecasting) "
-                              "or random (leaky; for quantifying the leak only)."),
+        "chronological", help="chronological (default; the honest choice for a single time-"
+                              "ordered evaluation) | random (leaky; quantifies the leak only) | "
+                              "loeo (leave-one-event-out CV -- writes a single flat 'all' split; "
+                              "run cnn_lstm_loeo.py on the result. Preferable once pooling "
+                              "--region gives you enough targets that a single chronological "
+                              "cut is the bottleneck, since every event gets to be the test "
+                              "fold once instead of only whichever ones land after the cut)."),
     embargo_days: Optional[float] = typer.Option(
         None, help="Gap between splits. Defaults to the full label horizon, so no training "
                    "window's label can reference an event inside the test period."),
@@ -293,11 +305,24 @@ def generate_catalog_dataset_cmd(
     if None not in (lat_min, lat_max, lon_min, lon_max):
         bbox = (lat_min, lat_max, lon_min, lon_max)
     center = (center_lat, center_lon) if None not in (center_lat, center_lon) else None
+
+    regions = None
+    if region:
+        try:
+            regions = [tuple(float(x) for x in r.split(",")) for r in region]
+        except ValueError:
+            raise typer.BadParameter("--region must be 'lat_min,lat_max,lon_min,lon_max'")
+        if any(len(r) != 4 for r in regions):
+            raise typer.BadParameter("--region must be 'lat_min,lat_max,lon_min,lon_max'")
+
+    if split_mode not in ("chronological", "random", "loeo"):
+        raise typer.BadParameter("--split-mode must be chronological, random, or loeo")
+
     catalog.run_catalog_dataset(
         catalog_path=catalog_path, output_dir=output_dir, window_events=window_events,
         stride_events=stride_events, major_magnitude=major_magnitude,
         min_magnitude=min_magnitude, target_n=target_n, bbox=bbox, center=center,
-        radius_km=radius_km, split_mode=split_mode,
+        radius_km=radius_km, regions=regions, split_mode=split_mode,
         ratios=(train_ratio, val_ratio, test_ratio), embargo_days=embargo_days,
         max_horizon_days=max_horizon_days, seed=seed,
         class_boundaries=((class_lo_days, class_hi_days)
