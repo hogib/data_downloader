@@ -57,9 +57,8 @@ def reshape_to_target_n(x: np.ndarray, target_n: int) -> Tuple[np.ndarray, int]:
     return x.reshape((target_n, d)).T, d
 
 
-def _ram_core(x: np.ndarray, target_n: int, mu: Optional[float] = None,
-              sigma: Optional[float] = None, eps: float = 1e-12
-              ) -> Tuple[np.ndarray, np.ndarray, int]:
+def ram_matrix(x: np.ndarray, target_n: int, mu: Optional[float] = None,
+               sigma: Optional[float] = None, eps: float = 1e-12) -> Tuple[np.ndarray, int]:
     x_std = standardize(x, mu=mu, sigma=sigma, eps=eps)
     M, d = reshape_to_target_n(x_std, target_n=target_n)
     Xbar = np.mean(M, axis=1)
@@ -76,31 +75,7 @@ def _ram_core(x: np.ndarray, target_n: int, mu: Optional[float] = None,
         cos_val = np.dot(Xi, Xbar) / (norm_Xi * norm_Xbar)
         cos_val = np.clip(cos_val, -1.0, 1.0)
         betas[i] = np.arccos(cos_val)
-    return M, betas, d
-
-
-def ram_matrix(x: np.ndarray, target_n: int, mu: Optional[float] = None,
-               sigma: Optional[float] = None, eps: float = 1e-12) -> Tuple[np.ndarray, int]:
-    _, betas, d = _ram_core(x, target_n=target_n, mu=mu, sigma=sigma, eps=eps)
     return betas[None, :] - betas[:, None], d
-
-
-def ram_matrix_and_chunks(x: np.ndarray, target_n: int, mu: Optional[float] = None,
-                          sigma: Optional[float] = None, eps: float = 1e-12
-                          ) -> Tuple[np.ndarray, np.ndarray, int]:
-    """
-    Like `ram_matrix`, but also returns the (target_n, d) chunk matrix each
-    pixel's angle is computed from -- the RAM paper's "1D channel" companion
-    to the "2D channel" image, for a dual CNN+LSTM classifier where both
-    branches see the same reshaped window (see `RamDualEncoder`). Column i of
-    the returned M is chunk i of d consecutive standardized samples; beta_i
-    (and therefore row/column i of the image) is that chunk's angular
-    deviation from the mean chunk shape, so M.T (target_n steps of d features
-    each) is the natural sequence to pair with the target_n x target_n image.
-    """
-    M, betas, d = _ram_core(x, target_n=target_n, mu=mu, sigma=sigma, eps=eps)
-    R = betas[None, :] - betas[:, None]
-    return R, M.T, d
 
 
 def to_uint8(mat: np.ndarray) -> np.ndarray:

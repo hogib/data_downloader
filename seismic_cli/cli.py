@@ -195,9 +195,12 @@ def generate_dual_dataset_cmd(
     output_dir: str = typer.Option(..., help="Where to write the dataset (train/val/test + manifest.csv)."),
     window_seconds: float = typer.Option(60.0, help="Window length in seconds."),
     overlap: float = typer.Option(0.5, help="Overlap fraction for sliding windows."),
-    target_n: int = typer.Option(64, help="RAM image resolution (n x n); also the 1D sequence length."),
+    target_n: int = typer.Option(64, help="RAM image resolution (n x n)."),
     fs: float = typer.Option(100.0, help="Nominal sampling rate; every window is resampled to this "
-                                          "so all seq tensors share one shape."),
+                                          "so all seq tensors share one shape. Also sets the 1D "
+                                          "branch's sequence length (fs * window_seconds) -- self-"
+                                          "attention there is O(m^2), so long windows at high fs "
+                                          "may need a smaller --batch-size when training."),
     train_ratio: float = typer.Option(0.70),
     val_ratio: float = typer.Option(0.15),
     test_ratio: float = typer.Option(0.15),
@@ -220,9 +223,10 @@ def generate_dual_dataset_cmd(
     Generates a station-disjoint, balanced dataset of paired {seq, img} tensors
     for the dual-channel CNN+LSTM (1D2D-EDL) architecture from Wang & Zhao
     (2025), applied directly to earthquake/noise classification instead of the
-    catalog forecasting task -- both branches see the same reshaped window
-    (see seismic_cli/ram_dual.py). Train with cnn_earthquake's
-    cnn_lstm_classify.py.
+    catalog forecasting task -- seq is the raw standardized (m, 3) Z/N/E
+    waveform (the paper's 1D-channel LSTM input) and img is the RAM
+    difference image built from the same window (see seismic_cli/ram_dual.py).
+    Train with cnn_earthquake's cnn_lstm_classify.py.
     """
     if generate_max and limit_pictures:
         raise typer.BadParameter("--max and --limit-pictures are mutually exclusive.")
