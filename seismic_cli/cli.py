@@ -274,6 +274,12 @@ def generate_catalog_dataset_cmd(
     train_ratio: float = typer.Option(0.70), val_ratio: float = typer.Option(0.15),
     test_ratio: float = typer.Option(0.15),
     seed: int = typer.Option(42),
+    decluster: bool = typer.Option(
+        True, "--decluster/--no-decluster",
+        help="Restrict prediction TARGETS to independent mainshocks via Gardner-Knopoff "
+             "(1974) space-time windows, so one earthquake's own aftershock sequence isn't "
+             "counted as multiple targets. Aftershocks stay in the window feature sequence "
+             "either way. Disable only to reproduce the un-declustered behaviour."),
 ):
     """
     Builds sliding-window training data from an earthquake catalog for the
@@ -296,6 +302,7 @@ def generate_catalog_dataset_cmd(
         max_horizon_days=max_horizon_days, seed=seed,
         class_boundaries=((class_lo_days, class_hi_days)
                           if None not in (class_lo_days, class_hi_days) else None),
+        decluster=decluster,
     )
 
 

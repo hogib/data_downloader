@@ -202,11 +202,77 @@ def energy_joules(mag: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Declustering (mainshock/aftershock separation for TARGET selection)
+# ---------------------------------------------------------------------------
+
+def gardner_knopoff_windows(mag: float) -> Tuple[float, float]:
+    """
+    Gardner & Knopoff (1974) space-time windows for a mainshock of this
+    magnitude: (L_km, T_days). An event inside another, larger event's window
+    is its aftershock, not an independent earthquake.
+    """
+    l_km = 10.0 ** (0.1238 * mag + 0.983)
+    if mag >= 6.5:
+        t_days = 10.0 ** (0.032 * mag + 2.7389)
+    else:
+        t_days = 10.0 ** (0.5409 * mag - 0.547)
+    return float(l_km), float(t_days)
+
+
+def decluster_gardner_knopoff(df: pd.DataFrame) -> np.ndarray:
+    """
+    Flags independent mainshocks, largest magnitude first: any smaller event
+    falling inside a claimed mainshock's Gardner-Knopoff space-time window is
+    marked as that mainshock's aftershock and excluded from future claims.
+
+    Returns a boolean mask over `df` (True = independent mainshock).
+
+    This matters only for TARGET selection -- aftershocks stay in the catalog
+    as window FEATURES (they are real seismicity). Without this, a single
+    mainshock's aftershock sequence masquerades as many independent "targets",
+    which both inflates the apparent sample size and collapses the label
+    horizon onto Omori-decay timescales (days-weeks) instead of tectonic
+    recurrence (years) -- exactly what happened on a real run where 8 of 31
+    "targets" turned out to be one M6.2's own aftershocks dated the same day.
+    """
+    n = len(df)
+    is_main = np.ones(n, dtype=bool)
+    order = np.argsort(-df.magnitude.to_numpy(dtype=np.float64))  # largest first
+    t = df.time.to_numpy()
+    lat = df.lat.to_numpy(dtype=np.float64)
+    lon = df.lon.to_numpy(dtype=np.float64)
+    mag = df.magnitude.to_numpy(dtype=np.float64)
+
+    for i in order:
+        if not is_main[i]:
+            continue                        # already claimed as someone else's aftershock
+        l_km, t_days = gardner_knopoff_windows(mag[i])
+        dt_days = (t - t[i]) / np.timedelta64(1, "D")
+        d_km = haversine_km(lat, lon, lat[i], lon[i])
+        # Same-magnitude ties and same-day catalogs put candidates at dt == 0,
+        # so this must be >= 0, not > 0, or those events escape declustering
+        # entirely; dt < 0 (earlier, larger events) already excluded them above.
+        # mag <= mag[i] additionally stops a small foreshock a few minutes
+        # ahead of a much bigger mainshock from "claiming" the mainshock as
+        # ITS aftershock -- caught on real data where an M3.9 36 minutes
+        # before the M6.2 Marmara/Silivri mainshock was demoting the M6.2.
+        cand = is_main & (dt_days >= 0) & (dt_days <= t_days) & (d_km <= l_km) & (mag <= mag[i])
+        cand[i] = False                     # never claim the mainshock itself
+        is_main[cand] = False
+
+    n_removed = n - int(is_main.sum())
+    print(f"[decluster] Gardner-Knopoff: {int(is_main.sum())}/{n} events are independent "
+          f"mainshocks ({n_removed} flagged as aftershocks of a larger nearby event).")
+    return is_main
+
+
+# ---------------------------------------------------------------------------
 # Windowing
 # ---------------------------------------------------------------------------
 
 def report_major_events(df: pd.DataFrame, major_magnitude: float,
-                        max_horizon_days: float = 3650.0) -> int:
+                        max_horizon_days: float = 3650.0,
+                        target_mask: Optional[np.ndarray] = None) -> int:
     """
     Lists the events that will serve as prediction targets, before any windowing.
 
@@ -217,8 +283,15 @@ def report_major_events(df: pd.DataFrame, major_magnitude: float,
     windows the slider produces from it -- every window is labelled by the same
     earthquake. Surfacing this up front turns a confusing empty split into an
     obvious, actionable diagnosis.
+
+    `target_mask`, when given, additionally restricts targets to independent
+    mainshocks (see `decluster_gardner_knopoff`) -- otherwise an aftershock
+    sequence counts as many "targets" for the same earthquake.
     """
-    majors = df[df.magnitude >= major_magnitude].sort_values("time")
+    eligible = df.magnitude >= major_magnitude
+    if target_mask is not None:
+        eligible = eligible & pd.Series(target_mask, index=df.index)
+    majors = df[eligible].sort_values("time")
     n = len(majors)
     print(f"\n[targets] {n} event(s) with M >= {major_magnitude} in this region "
           f"-- these are the prediction targets, and their count is the real sample size.")
@@ -249,7 +322,8 @@ def report_major_events(df: pd.DataFrame, major_magnitude: float,
 
 
 def build_windows(df: pd.DataFrame, window_events: int, stride_events: int,
-                  major_magnitude: float, max_horizon_days: float = 3650.0
+                  major_magnitude: float, max_horizon_days: float = 3650.0,
+                  target_mask: Optional[np.ndarray] = None
                   ) -> List[dict]:
     """
     Slides a fixed-EVENT-COUNT window along the catalog.
@@ -260,10 +334,14 @@ def build_windows(df: pd.DataFrame, window_events: int, stride_events: int,
     (a burst of N events in 3 days is a very different state from N events
     over 3 years).
 
-    A window is labelled by the time from its LAST event to the next event of
-    magnitude >= major_magnitude. Windows containing a major event are dropped
-    -- they describe the aftermath, not a precursor state, and keeping them
-    would let the model read the answer off its own input.
+    A window is labelled by the time from its LAST event to the next TARGET
+    event of magnitude >= major_magnitude (restricted to `target_mask` when
+    given, i.e. independent mainshocks only -- see `decluster_gardner_knopoff`).
+    Windows containing a raw M >= major_magnitude event (target or not) are
+    still dropped: they describe the aftermath, not a precursor state, and
+    keeping them would let the model read the answer off its own input. Every
+    other event, including aftershocks excluded from `target_mask`, remains in
+    the window FEATURE sequence -- that seismicity is real and informative.
     """
     t = df.time.to_numpy()
     mag = df.magnitude.to_numpy(dtype=np.float64)
@@ -271,10 +349,14 @@ def build_windows(df: pd.DataFrame, window_events: int, stride_events: int,
     depth = df.depth.to_numpy(dtype=np.float64)
     energy = energy_joules(mag)
 
-    major_idx = np.flatnonzero(mag >= major_magnitude)
+    target_eligible = mag >= major_magnitude
+    if target_mask is not None:
+        target_eligible = target_eligible & np.asarray(target_mask, dtype=bool)
+    major_idx = np.flatnonzero(target_eligible)
     if len(major_idx) == 0:
-        raise ValueError(f"No events with M >= {major_magnitude} in this region; "
-                         f"lower --major-magnitude or widen the region.")
+        raise ValueError(f"No target events with M >= {major_magnitude} in this region "
+                         f"(after declustering, if enabled); lower --major-magnitude, "
+                         f"widen the region, or pass --no-decluster.")
     major_times = t[major_idx]
 
     out = []
@@ -533,7 +615,8 @@ def run_catalog_dataset(catalog_path: str, output_dir: str, window_events: int =
                         split_mode: str = "chronological", ratios=(0.70, 0.15, 0.15),
                         embargo_days: Optional[float] = None,
                         max_horizon_days: float = 3650.0, seed: int = 42,
-                        class_boundaries: Optional[Sequence[float]] = None) -> None:
+                        class_boundaries: Optional[Sequence[float]] = None,
+                        decluster: bool = True) -> None:
     print("=" * 64)
     print("CATALOG SLIDING-WINDOW DATASET (time-to-major-earthquake)")
     print("=" * 64)
@@ -543,9 +626,17 @@ def run_catalog_dataset(catalog_path: str, output_dir: str, window_events: int =
         print(f"[ERROR] Only {len(df)} events after filtering; need at least "
               f"{window_events * 2} for a usable dataset.")
         return
-    report_major_events(df, major_magnitude, max_horizon_days)
+
+    target_mask = None
+    if decluster:
+        target_mask = decluster_gardner_knopoff(df)
+    else:
+        print("[decluster] disabled (--no-decluster) -- aftershock sequences may appear "
+              "as multiple independent targets.")
+
+    report_major_events(df, major_magnitude, max_horizon_days, target_mask=target_mask)
     windows = build_windows(df, window_events, stride_events, major_magnitude,
-                            max_horizon_days=max_horizon_days)
+                            max_horizon_days=max_horizon_days, target_mask=target_mask)
     if not windows:
         print("[ERROR] No usable windows.")
         return
