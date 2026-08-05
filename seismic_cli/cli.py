@@ -23,7 +23,7 @@ from typing import List, Optional
 
 import typer
 
-from seismic_cli import (anchor, catalog, eval_baseline, regression,
+from seismic_cli import (anchor, catalog, eval_baseline, ram_dual, regression,
                          spectrogram)
 from seismic_cli.core import RamImageEncoder, run_balanced_preprocessing
 
@@ -184,6 +184,56 @@ def generate_spectrogram_dataset_cmd(
         fs=fs, window_seconds=window_seconds, overlap=overlap,
         limit_pictures=limit_pictures, max_windows_per_station=max_windows_per_station,
         freqmin=freqmin, freqmax=freqmax, num_cores=num_cores,
+        generate_max=generate_max, encoder=encoder,
+    )
+
+
+@app.command("generate-dual-dataset")
+def generate_dual_dataset_cmd(
+    eq_dir: str = typer.Option(..., help="Directory of earthquake mseed files."),
+    noise_dir: str = typer.Option(..., help="Directory of noise mseed files."),
+    output_dir: str = typer.Option(..., help="Where to write the dataset (train/val/test + manifest.csv)."),
+    window_seconds: float = typer.Option(60.0, help="Window length in seconds."),
+    overlap: float = typer.Option(0.5, help="Overlap fraction for sliding windows."),
+    target_n: int = typer.Option(64, help="RAM image resolution (n x n); also the 1D sequence length."),
+    fs: float = typer.Option(100.0, help="Nominal sampling rate; every window is resampled to this "
+                                          "so all seq tensors share one shape."),
+    train_ratio: float = typer.Option(0.70),
+    val_ratio: float = typer.Option(0.15),
+    test_ratio: float = typer.Option(0.15),
+    limit_pictures: Optional[int] = typer.Option(None, help="Cap total tensors. Mutually exclusive with --max."),
+    generate_max: bool = typer.Option(False, "--max", help="Generate the maximum balanced dataset."),
+    max_windows_per_station: Optional[int] = typer.Option(None, help="Per-window cap on any single station."),
+    baseline: bool = typer.Option(
+        False, "--baseline/--no-baseline",
+        help="Standardize each channel against that station's long-term noise baseline "
+             "instead of the window's own statistics, applied identically to both the "
+             "seq and img branches (falls back to self-standardization per-channel for "
+             "any station without enough noise data)."),
+    freqmin: float = typer.Option(1.0, help="Bandpass low corner (Hz)."),
+    freqmax: float = typer.Option(45.0, help="Bandpass high corner (Hz)."),
+    min_baseline_seconds: float = typer.Option(60.0, help="Minimum seconds of usable noise data "
+                                                            "required before trusting a station's baseline."),
+    num_cores: Optional[int] = typer.Option(None, help="Worker processes (default: cpu_count - 1)."),
+):
+    """
+    Generates a station-disjoint, balanced dataset of paired {seq, img} tensors
+    for the dual-channel CNN+LSTM (1D2D-EDL) architecture from Wang & Zhao
+    (2025), applied directly to earthquake/noise classification instead of the
+    catalog forecasting task -- both branches see the same reshaped window
+    (see seismic_cli/ram_dual.py). Train with cnn_earthquake's
+    cnn_lstm_classify.py.
+    """
+    if generate_max and limit_pictures:
+        raise typer.BadParameter("--max and --limit-pictures are mutually exclusive.")
+    encoder = ram_dual.RamDualEncoder(target_n=target_n, nominal_fs=fs, window_seconds=window_seconds)
+    run_balanced_preprocessing(
+        eq_dir=eq_dir, noise_dir=noise_dir, output_dir=output_dir,
+        split_ratios=(train_ratio, val_ratio, test_ratio),
+        target_n=target_n, fs=fs, window_seconds=window_seconds, overlap=overlap,
+        limit_pictures=limit_pictures, max_windows_per_station=max_windows_per_station,
+        use_baseline_standardization=baseline, freqmin=freqmin, freqmax=freqmax,
+        min_baseline_seconds=min_baseline_seconds, num_cores=num_cores,
         generate_max=generate_max, encoder=encoder,
     )
 
