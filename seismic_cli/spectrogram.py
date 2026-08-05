@@ -130,12 +130,11 @@ class SpectrogramEncoder:
         t = torch.from_numpy(np.ascontiguousarray(x.T)).float()
         return db_tf(spec_tf(t))
 
-    # -- encoder protocol -------------------------------------------------
-    def __call__(self, cleaned_win, fs_station, sta_key, selection,
-                 station_baselines, out_dir, stem):
+    def normalize_spec(self, s, sta_key, selection):
+        """Applies `self.normalize` to a raw (3, freq, time) dB tensor. Split
+        out from `__call__` so `SpectrogramDualEncoder` can reuse the exact
+        same normalization instead of a second, drifting copy of it."""
         torch, _, _ = self._transforms()
-        s = self.spec_db(cleaned_win, fs_station)
-
         if self.normalize == "station":
             applied = False
             if self.noise_profiles:
@@ -148,9 +147,68 @@ class SpectrogramEncoder:
                 s = (s - s.mean()) / (s.std() + 1e-6)
         elif self.normalize == "per_window":
             s = (s - s.mean()) / (s.std() + 1e-6)
+        return s
 
+    # -- encoder protocol -------------------------------------------------
+    def __call__(self, cleaned_win, fs_station, sta_key, selection,
+                 station_baselines, out_dir, stem):
+        torch, _, _ = self._transforms()
+        s = self.normalize_spec(self.spec_db(cleaned_win, fs_station), sta_key, selection)
         filename = stem + self.ext
         torch.save(s.contiguous(), out_dir / filename)
+        return filename
+
+
+class SpectrogramDualEncoder:
+    """
+    Pairs the paper's raw-waveform 1D channel (see `ram_dual.RamDualEncoder`)
+    with a log-power SPECTROGRAM as the 2D channel instead of a RAM image.
+
+    RAM is exactly scale-invariant (report.md 8.2), so its image cannot carry
+    absolute amplitude -- the earlier dual-channel classification runs found
+    the RAM-image branch was consistently the weaker of the two (test AUC
+    0.841 vs the raw-waveform branch's 0.922 on 6s windows), and that fusing
+    it in hurt the fused model relative to the raw-waveform branch alone.
+    Spectrograms keep amplitude-above-noise information (with
+    `normalize="station"`), so this tests whether giving the 2D channel a
+    stronger, non-scale-invariant representation changes that picture -- same
+    1D branch, same fusion architecture, only the "2D channel" strategy changes.
+
+    Wraps a `SpectrogramEncoder` rather than reimplementing spectrogram
+    computation, so both encoders stay identical wherever they overlap.
+    """
+    ext = ".pt"
+    requires_spawn = True
+
+    def __init__(self, spec_encoder: SpectrogramEncoder):
+        self.spec_encoder = spec_encoder
+        self.nominal_fs = spec_encoder.nominal_fs
+        self.window_seconds = spec_encoder.window_seconds
+
+    def target_samples(self) -> int:
+        return int(round(self.nominal_fs * self.window_seconds))
+
+    def __call__(self, cleaned_win, fs_station, sta_key, selection,
+                 station_baselines, out_dir, stem):
+        from seismic_cli.core import standardize
+        torch, _, _ = self.spec_encoder._transforms()
+
+        # 2D channel: identical computation to SpectrogramEncoder alone.
+        s = self.spec_encoder.normalize_spec(
+            self.spec_encoder.spec_db(cleaned_win, fs_station), sta_key, selection)
+
+        # 1D channel: raw standardized waveform, matching RamDualEncoder /
+        # the paper's Sec. 3.3.1 exactly -- only the 2D representation differs.
+        x = _fit_length(_resample_to(cleaned_win, fs_station, self.nominal_fs),
+                        self.target_samples())
+        seqs = []
+        for i, comp in enumerate(selection):
+            mu, sigma = station_baselines.get((sta_key, comp), (None, None))
+            seqs.append(standardize(x[:, i], mu=mu, sigma=sigma))
+        seq = np.stack(seqs, axis=-1).astype(np.float32)
+
+        filename = stem + self.ext
+        torch.save({"seq": torch.from_numpy(seq), "img": s.contiguous().float()}, out_dir / filename)
         return filename
 
 
