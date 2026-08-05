@@ -212,6 +212,61 @@ class SpectrogramDualEncoder:
         return filename
 
 
+class SpectrogramDualAuxEncoder(SpectrogramDualEncoder):
+    """
+    `SpectrogramDualEncoder` plus the same [log_snr, log_rms] aux vector
+    `ram_aux.RamAuxEncoder` / `ram_dual.RamDualAuxEncoder` add to the RAM
+    classifiers -- report.md 10.5.3 found this the single largest effect
+    measured on the RAM side (test AUC 0.836 -> 0.923); this tests whether
+    it helps a representation that already preserves amplitude information
+    (a station-normalized spectrogram) rather than one that structurally
+    cannot (RAM, report.md 8.2). If spectrograms already carry amplitude,
+    the aux scalars may be redundant here where they were not for RAM.
+
+    `aux_baselines` is separate from the `station_baselines` argument
+    `__call__` receives from the pipeline (controlled by `--baseline`, which
+    affects only the seq branch's own standardization) -- log_snr needs a
+    noise baseline unconditionally, so it is baked in at construction like
+    `RamDualAuxEncoder`.
+    """
+
+    def __init__(self, spec_encoder: SpectrogramEncoder,
+                aux_baselines: Optional[Dict[Tuple[str, str], Tuple[float, float]]] = None):
+        super().__init__(spec_encoder)
+        self.aux_baselines = aux_baselines or {}
+
+    def __call__(self, cleaned_win, fs_station, sta_key, selection,
+                 station_baselines, out_dir, stem):
+        from seismic_cli.core import standardize
+        torch, _, _ = self.spec_encoder._transforms()
+
+        s = self.spec_encoder.normalize_spec(
+            self.spec_encoder.spec_db(cleaned_win, fs_station), sta_key, selection)
+
+        x = _fit_length(_resample_to(cleaned_win, fs_station, self.nominal_fs),
+                        self.target_samples())
+        seqs, snrs, rmss = [], [], []
+        for i, comp in enumerate(selection):
+            mu, sigma = station_baselines.get((sta_key, comp), (None, None))
+            seqs.append(standardize(x[:, i], mu=mu, sigma=sigma))
+
+            sigma_win = float(np.std(cleaned_win[:, i]))
+            if sigma_win > 0:
+                rmss.append(math.log(sigma_win))
+                _mu, sigma_noise = self.aux_baselines.get((sta_key, comp), (None, None))
+                if sigma_noise and sigma_noise > 0:
+                    snrs.append(math.log(sigma_win / sigma_noise))
+        seq = np.stack(seqs, axis=-1).astype(np.float32)
+        log_snr = float(np.mean(snrs)) if snrs else 0.0
+        log_rms = float(np.mean(rmss)) if rmss else 0.0
+        aux = np.array([log_snr, log_rms], dtype=np.float32)
+
+        filename = stem + self.ext
+        torch.save({"seq": torch.from_numpy(seq), "img": s.contiguous().float(),
+                    "aux": torch.from_numpy(aux)}, out_dir / filename)
+        return filename
+
+
 def compute_station_spectral_baselines(
     noise_dir: str,
     n_fft: int = 256,

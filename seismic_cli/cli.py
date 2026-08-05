@@ -315,6 +315,89 @@ def generate_spec_dual_dataset_cmd(
     )
 
 
+@app.command("generate-spec-dual-aux-dataset")
+def generate_spec_dual_aux_dataset_cmd(
+    eq_dir: str = typer.Option(..., help="Directory of earthquake mseed files."),
+    noise_dir: str = typer.Option(..., help="Directory of noise mseed files (also used for the "
+                                             "station noise baseline log_snr is measured against)."),
+    output_dir: str = typer.Option(..., help="Where to write the dataset (train/val/test + manifest.csv)."),
+    window_seconds: float = typer.Option(60.0, help="Window length in seconds."),
+    overlap: float = typer.Option(0.5, help="Overlap fraction for sliding windows."),
+    n_fft: int = typer.Option(256, help="FFT size; frequency bins = n_fft//2 + 1."),
+    hop_length: Optional[int] = typer.Option(None, help="STFT hop. Default n_fft//4."),
+    top_db: float = typer.Option(80.0, help="Dynamic-range clamp for the dB conversion."),
+    normalize: str = typer.Option(
+        "station", help="Spectrogram (2D channel) normalization; see generate-spectrogram-dataset."),
+    train_ratio: float = typer.Option(0.70),
+    val_ratio: float = typer.Option(0.15),
+    test_ratio: float = typer.Option(0.15),
+    limit_pictures: Optional[int] = typer.Option(None, help="Cap total tensors. Mutually exclusive with --max."),
+    generate_max: bool = typer.Option(False, "--max", help="Generate the maximum balanced dataset."),
+    max_windows_per_station: Optional[int] = typer.Option(None, help="Per-window cap on any single station."),
+    baseline: bool = typer.Option(
+        False, "--baseline/--no-baseline",
+        help="Standardize the 1D (raw-waveform) channel against that station's long-term "
+             "noise baseline instead of the window's own statistics. Independent of "
+             "--normalize (2D channel) and of the aux branch's log_snr, which always "
+             "needs a station baseline and is computed regardless of this flag."),
+    freqmin: float = typer.Option(1.0, help="Bandpass low corner (Hz)."),
+    freqmax: float = typer.Option(45.0, help="Bandpass high corner (Hz)."),
+    fs: float = typer.Option(100.0, help="Nominal sampling rate; every window is resampled to this "
+                                          "so all tensors share one shape. Also sets the 1D branch's "
+                                          "sequence length (fs * window_seconds) -- self-attention "
+                                          "there is O(m^2), so long windows at high fs may need a "
+                                          "smaller --batch-size when training."),
+    min_baseline_seconds: float = typer.Option(60.0, help="Minimum seconds of usable noise data "
+                                                            "required before trusting a station's baseline."),
+    num_cores: Optional[int] = typer.Option(None, help="Worker processes (default: cpu_count - 1)."),
+):
+    """
+    generate-spec-dual-dataset plus a log_snr/log_rms aux vector -- tests
+    whether the amplitude fix that helped the RAM classifiers (report.md
+    10.5.3) also helps a 2D representation (a station-normalized spectrogram)
+    that already preserves amplitude information, rather than one (RAM) that
+    structurally cannot. See seismic_cli/spectrogram.py's
+    SpectrogramDualAuxEncoder. Train with cnn_earthquake's
+    cnn_lstm_classify_aux.py.
+    """
+    if generate_max and limit_pictures:
+        raise typer.BadParameter("--max and --limit-pictures are mutually exclusive.")
+    if normalize not in spectrogram.NORMALIZE_MODES:
+        raise typer.BadParameter(f"--normalize must be one of {spectrogram.NORMALIZE_MODES}")
+
+    profiles = {}
+    if normalize == "station":
+        profiles = spectrogram.compute_station_spectral_baselines(
+            noise_dir, n_fft=n_fft, hop_length=hop_length, top_db=top_db,
+            nominal_fs=fs, freqmin=freqmin, freqmax=freqmax,
+        )
+        if not profiles:
+            print("[WARN] No spectral baselines built; every window falls back to per-window "
+                  "normalization for the 2D channel (instrument gain is removed, absolute "
+                  "amplitude is not preserved).")
+
+    aux_baselines, _ = compute_station_noise_baselines(
+        noise_dir, fs=fs, freqmin=freqmin, freqmax=freqmax, min_baseline_seconds=min_baseline_seconds,
+    )
+    if not aux_baselines:
+        print("[WARN] No station noise baselines built; log_snr will default to 0.0 for every window.")
+
+    spec_encoder = spectrogram.SpectrogramEncoder(
+        n_fft=n_fft, hop_length=hop_length, top_db=top_db, nominal_fs=fs,
+        window_seconds=window_seconds, normalize=normalize, noise_profiles=profiles,
+    )
+    encoder = spectrogram.SpectrogramDualAuxEncoder(spec_encoder, aux_baselines=aux_baselines)
+    run_balanced_preprocessing(
+        eq_dir=eq_dir, noise_dir=noise_dir, output_dir=output_dir,
+        split_ratios=(train_ratio, val_ratio, test_ratio),
+        fs=fs, window_seconds=window_seconds, overlap=overlap,
+        limit_pictures=limit_pictures, max_windows_per_station=max_windows_per_station,
+        use_baseline_standardization=baseline, freqmin=freqmin, freqmax=freqmax,
+        min_baseline_seconds=min_baseline_seconds, num_cores=num_cores,
+        generate_max=generate_max, encoder=encoder,
+    )
+
+
 @app.command("generate-dual-dataset")
 def generate_dual_dataset_cmd(
     eq_dir: str = typer.Option(..., help="Directory of earthquake mseed files."),
