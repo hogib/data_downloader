@@ -23,9 +23,10 @@ from typing import List, Optional
 
 import typer
 
-from seismic_cli import (anchor, catalog, eval_baseline, ram_dual, regression,
-                         spectrogram)
-from seismic_cli.core import RamImageEncoder, run_balanced_preprocessing
+from seismic_cli import (anchor, catalog, eval_baseline, ram_aux, ram_dual,
+                         regression, spectrogram)
+from seismic_cli.core import (RamImageEncoder, compute_station_noise_baselines,
+                              run_balanced_preprocessing)
 
 app = typer.Typer(help="Seismic RAM-image / CNN earthquake detection pipeline.")
 
@@ -123,6 +124,57 @@ def generate_dataset_cmd(
         min_baseline_seconds=min_baseline_seconds,
         num_cores=num_cores,
         generate_max=generate_max,
+    )
+
+
+@app.command("generate-ram-aux-dataset")
+def generate_ram_aux_dataset_cmd(
+    eq_dir: str = typer.Option(..., help="Directory of earthquake mseed files."),
+    noise_dir: str = typer.Option(..., help="Directory of noise mseed files (also used for the "
+                                             "station noise baseline log_snr is measured against)."),
+    output_dir: str = typer.Option(..., help="Where to write the dataset (train/val/test + manifest.csv)."),
+    window_seconds: float = typer.Option(60.0, help="Window length in seconds."),
+    overlap: float = typer.Option(0.5, help="Overlap fraction for sliding windows."),
+    target_n: int = typer.Option(64, help="RAM image resolution (n x n)."),
+    train_ratio: float = typer.Option(0.70),
+    val_ratio: float = typer.Option(0.15),
+    test_ratio: float = typer.Option(0.15),
+    limit_pictures: Optional[int] = typer.Option(None, help="Cap total tensors. Mutually exclusive with --max."),
+    generate_max: bool = typer.Option(False, "--max", help="Generate the maximum balanced dataset."),
+    max_windows_per_station: Optional[int] = typer.Option(None, help="Per-window cap on any single station."),
+    freqmin: float = typer.Option(1.0, help="Bandpass low corner (Hz)."),
+    freqmax: float = typer.Option(45.0, help="Bandpass high corner (Hz)."),
+    fs: float = typer.Option(100.0, help="Nominal sampling rate."),
+    min_baseline_seconds: float = typer.Option(60.0, help="Minimum seconds of usable noise data "
+                                                            "required before trusting a station's baseline "
+                                                            "for log_snr (falls back to 0.0 otherwise)."),
+    num_cores: Optional[int] = typer.Option(None, help="Worker processes (default: cpu_count - 1)."),
+):
+    """
+    Generates a station-disjoint, balanced dataset of paired {img, aux}
+    tensors: the standard RAM image plus log_snr and log_rms -- the amplitude
+    information RAM's exact scale-invariance structurally discards (see
+    seismic_cli/ram_aux.py). Train with cnn_earthquake's cnn_ram_aux.py,
+    which ablates the aux branch with --no-aux for a direct before/after
+    comparison against the plain RAM-only classifier.
+    """
+    if generate_max and limit_pictures:
+        raise typer.BadParameter("--max and --limit-pictures are mutually exclusive.")
+
+    station_baselines, _ = compute_station_noise_baselines(
+        noise_dir, fs=fs, freqmin=freqmin, freqmax=freqmax, min_baseline_seconds=min_baseline_seconds,
+    )
+    if not station_baselines:
+        print("[WARN] No station noise baselines built; log_snr will default to 0.0 for every window.")
+
+    encoder = ram_aux.RamAuxEncoder(target_n=target_n, station_baselines=station_baselines)
+    run_balanced_preprocessing(
+        eq_dir=eq_dir, noise_dir=noise_dir, output_dir=output_dir,
+        split_ratios=(train_ratio, val_ratio, test_ratio),
+        target_n=target_n, fs=fs, window_seconds=window_seconds, overlap=overlap,
+        limit_pictures=limit_pictures, max_windows_per_station=max_windows_per_station,
+        freqmin=freqmin, freqmax=freqmax, num_cores=num_cores,
+        generate_max=generate_max, encoder=encoder,
     )
 
 
