@@ -20,7 +20,7 @@ from sklearn.metrics import (accuracy_score, precision_score, recall_score,
 
 from seismic_cli.core import select_components
 
-FILENAME_RE = re.compile(r"_win(\d+)\.png$")
+FILENAME_RE = re.compile(r"_win(\d+)\.(?:png|pt)$")
 
 # Floors/caps for the dynamically derived STA/LTA parameters.
 MIN_STA_SECONDS = 0.05   # 5 samples at 100 Hz -- shorter is just noise
@@ -38,6 +38,26 @@ def derive_sta_lta_params(window_seconds: float) -> tuple:
     MIN_STA_SECONDS). At 60s this reproduces the original 1.0/10.0 exactly,
     so existing long-window results are unchanged; at 6s it yields 0.2/2.0
     and at 3s 0.1/1.0.
+
+    **Known limitation, confirmed empirically (report.md, "STA/LTA Parameter
+    Sensitivity on Anchored Windows").** `classic_sta_lta`'s characteristic
+    function is exactly 0 for its first `nlta` samples (no long-term average
+    exists yet). `anchor.py`'s default `pre_arrival_fraction=0.2` places the
+    P-wave arrival at only 20% into an anchored window, but this formula's
+    LTA is 33% of the window (window/3) -- so for ANY anchored window under
+    ~50s, LTA/window > pre_arrival_fraction, meaning the arrival itself
+    falls inside the forced-zero warm-up region and is invisible to the
+    characteristic function. Measured on the 6s anchored dataset: this
+    formula's defaults (STA=0.2s, LTA=2.0s) give AUC 0.51 (indistinguishable
+    from random); a validation-selected LTA that respects the anchoring
+    buffer (STA=0.03s, LTA=0.3s) gives AUC 0.82. This is NOT fixed here
+    automatically, since 60s windows are unanchored (sliced from origin
+    time, not arrival time) and this exact formula is relied on to reproduce
+    their historical 1.0/10.0 parameters unchanged. For any ANCHORED window
+    (anything generated via `anchor-windows`), pass `--sta-seconds`/
+    `--lta-seconds` explicitly with LTA comfortably under
+    `pre_arrival_fraction * window_seconds`, rather than trusting this
+    auto-derivation.
     """
     lta_seconds = min(MAX_LTA_SECONDS, window_seconds / 3.0)
     sta_seconds = max(MIN_STA_SECONDS, lta_seconds / 10.0)
@@ -145,6 +165,13 @@ def run_eval_sta_lta(
         lta_seconds = auto_lta
     source = "auto-derived from window length" if derived else "explicitly set"
     print(f"[params] window={window_seconds:g}s -> STA={sta_seconds:g}s, LTA={lta_seconds:g}s ({source})")
+    if derived and lta_seconds > 0.15 * window_seconds:
+        print(f"[WARN] LTA={lta_seconds:g}s is >15% of the window. If this manifest was built from "
+              f"arrival-anchored windows (`anchor-windows`, default pre_arrival_fraction=0.2), the "
+              f"arrival likely falls inside classic_sta_lta's forced-zero warm-up region, silently "
+              f"crippling this baseline (measured: AUC 0.51 vs 0.82 with a properly bounded LTA on a "
+              f"6s anchored dataset -- see derive_sta_lta_params docstring). Pass --sta-seconds/"
+              f"--lta-seconds explicitly for anchored windows.")
 
     manifest_path = Path(manifest_path)
     print(f"[load] Reading manifest: {manifest_path}")
