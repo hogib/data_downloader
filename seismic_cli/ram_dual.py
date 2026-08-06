@@ -163,3 +163,44 @@ class RamDualAuxEncoder(RamDualEncoder):
         torch.save({"seq": torch.from_numpy(seq), "img": torch.from_numpy(img),
                     "aux": torch.from_numpy(aux)}, out_dir / filename)
         return filename
+
+
+class RamDualAuxEncoderV2(RamDualAuxEncoder):
+    """`RamDualAuxEncoder` but aux is 6 per-component scalars instead of 2
+    Z/N/E-averaged ones -- see `ram_aux.RamAuxEncoderV2`'s docstring for the
+    full rationale; identical semantics here, only the seq/img computation
+    (unchanged from `RamDualAuxEncoder`) differs."""
+
+    def __call__(self, cleaned_win, fs_station, sta_key, selection,
+                 station_baselines: Dict[Tuple[str, str], Tuple[Optional[float], Optional[float]]],
+                 out_dir, stem):
+        import torch
+
+        comp_z, comp_n, comp_e = selection
+        x = _fit_length(_resample_to(cleaned_win, fs_station, self.nominal_fs),
+                        self.target_samples())
+
+        seqs, imgs = [], []
+        snrs = [0.0, 0.0, 0.0]
+        rmss = [0.0, 0.0, 0.0]
+        for i, comp in enumerate((comp_z, comp_n, comp_e)):
+            mu, sigma = station_baselines.get((sta_key, comp), (None, None))
+            seqs.append(standardize(x[:, i], mu=mu, sigma=sigma))
+            R, _ = ram_matrix(x[:, i], target_n=self.target_n, mu=mu, sigma=sigma)
+            imgs.append((np.clip(R, -np.pi, np.pi) + np.pi) / (2 * np.pi))
+
+            sigma_win = float(np.std(cleaned_win[:, i]))
+            if sigma_win > 0:
+                rmss[i] = math.log(sigma_win)
+                _mu, sigma_noise = self.aux_baselines.get((sta_key, comp), (None, None))
+                if sigma_noise and sigma_noise > 0:
+                    snrs[i] = math.log(sigma_win / sigma_noise)
+
+        seq = np.stack(seqs, axis=-1).astype(np.float32)
+        img = np.stack(imgs, axis=0).astype(np.float32)
+        aux = np.array(snrs + rmss, dtype=np.float32)   # (6,)
+
+        filename = stem + self.ext
+        torch.save({"seq": torch.from_numpy(seq), "img": torch.from_numpy(img),
+                    "aux": torch.from_numpy(aux)}, out_dir / filename)
+        return filename

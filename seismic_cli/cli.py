@@ -148,6 +148,11 @@ def generate_ram_aux_dataset_cmd(
     min_baseline_seconds: float = typer.Option(60.0, help="Minimum seconds of usable noise data "
                                                             "required before trusting a station's baseline "
                                                             "for log_snr (falls back to 0.0 otherwise)."),
+    per_component_aux: bool = typer.Option(
+        False, "--per-component-aux",
+        help="Emit 6 per-component aux scalars [log_snr_Z,N,E, log_rms_Z,N,E] instead of "
+             "the 2 Z/N/E-averaged scalars. Off by default so existing datasets reproduce "
+             "byte-for-byte when regenerated."),
     num_cores: Optional[int] = typer.Option(None, help="Worker processes (default: cpu_count - 1)."),
 ):
     """
@@ -167,7 +172,8 @@ def generate_ram_aux_dataset_cmd(
     if not station_baselines:
         print("[WARN] No station noise baselines built; log_snr will default to 0.0 for every window.")
 
-    encoder = ram_aux.RamAuxEncoder(target_n=target_n, station_baselines=station_baselines)
+    encoder_cls = ram_aux.RamAuxEncoderV2 if per_component_aux else ram_aux.RamAuxEncoder
+    encoder = encoder_cls(target_n=target_n, station_baselines=station_baselines)
     run_balanced_preprocessing(
         eq_dir=eq_dir, noise_dir=noise_dir, output_dir=output_dir,
         split_ratios=(train_ratio, val_ratio, test_ratio),
@@ -349,6 +355,10 @@ def generate_spec_dual_aux_dataset_cmd(
                                           "smaller --batch-size when training."),
     min_baseline_seconds: float = typer.Option(60.0, help="Minimum seconds of usable noise data "
                                                             "required before trusting a station's baseline."),
+    per_component_aux: bool = typer.Option(
+        False, "--per-component-aux",
+        help="Emit 6 per-component aux scalars instead of 2 Z/N/E-averaged ones. Off by "
+             "default so existing datasets reproduce byte-for-byte when regenerated."),
     num_cores: Optional[int] = typer.Option(None, help="Worker processes (default: cpu_count - 1)."),
 ):
     """
@@ -386,7 +396,9 @@ def generate_spec_dual_aux_dataset_cmd(
         n_fft=n_fft, hop_length=hop_length, top_db=top_db, nominal_fs=fs,
         window_seconds=window_seconds, normalize=normalize, noise_profiles=profiles,
     )
-    encoder = spectrogram.SpectrogramDualAuxEncoder(spec_encoder, aux_baselines=aux_baselines)
+    encoder_cls = (spectrogram.SpectrogramDualAuxEncoderV2 if per_component_aux
+                  else spectrogram.SpectrogramDualAuxEncoder)
+    encoder = encoder_cls(spec_encoder, aux_baselines=aux_baselines)
     run_balanced_preprocessing(
         eq_dir=eq_dir, noise_dir=noise_dir, output_dir=output_dir,
         split_ratios=(train_ratio, val_ratio, test_ratio),
@@ -482,6 +494,10 @@ def generate_dual_aux_dataset_cmd(
     freqmax: float = typer.Option(45.0, help="Bandpass high corner (Hz)."),
     min_baseline_seconds: float = typer.Option(60.0, help="Minimum seconds of usable noise data "
                                                             "required before trusting a station's baseline."),
+    per_component_aux: bool = typer.Option(
+        False, "--per-component-aux",
+        help="Emit 6 per-component aux scalars instead of 2 Z/N/E-averaged ones. Off by "
+             "default so existing datasets reproduce byte-for-byte when regenerated."),
     num_cores: Optional[int] = typer.Option(None, help="Worker processes (default: cpu_count - 1)."),
 ):
     """
@@ -501,8 +517,9 @@ def generate_dual_aux_dataset_cmd(
     if not aux_baselines:
         print("[WARN] No station noise baselines built; log_snr will default to 0.0 for every window.")
 
-    encoder = ram_dual.RamDualAuxEncoder(target_n=target_n, nominal_fs=fs, window_seconds=window_seconds,
-                                         aux_baselines=aux_baselines)
+    encoder_cls = ram_dual.RamDualAuxEncoderV2 if per_component_aux else ram_dual.RamDualAuxEncoder
+    encoder = encoder_cls(target_n=target_n, nominal_fs=fs, window_seconds=window_seconds,
+                          aux_baselines=aux_baselines)
     run_balanced_preprocessing(
         eq_dir=eq_dir, noise_dir=noise_dir, output_dir=output_dir,
         split_ratios=(train_ratio, val_ratio, test_ratio),

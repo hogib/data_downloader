@@ -267,6 +267,44 @@ class SpectrogramDualAuxEncoder(SpectrogramDualEncoder):
         return filename
 
 
+class SpectrogramDualAuxEncoderV2(SpectrogramDualAuxEncoder):
+    """`SpectrogramDualAuxEncoder` but aux is 6 per-component scalars
+    instead of 2 Z/N/E-averaged ones -- see `ram_aux.RamAuxEncoderV2`'s
+    docstring for the full rationale; identical semantics here, only the
+    seq/img computation (unchanged from `SpectrogramDualAuxEncoder`) differs."""
+
+    def __call__(self, cleaned_win, fs_station, sta_key, selection,
+                 station_baselines, out_dir, stem):
+        from seismic_cli.core import standardize
+        torch, _, _ = self.spec_encoder._transforms()
+
+        s = self.spec_encoder.normalize_spec(
+            self.spec_encoder.spec_db(cleaned_win, fs_station), sta_key, selection)
+
+        x = _fit_length(_resample_to(cleaned_win, fs_station, self.nominal_fs),
+                        self.target_samples())
+        seqs = []
+        snrs = [0.0, 0.0, 0.0]
+        rmss = [0.0, 0.0, 0.0]
+        for i, comp in enumerate(selection):
+            mu, sigma = station_baselines.get((sta_key, comp), (None, None))
+            seqs.append(standardize(x[:, i], mu=mu, sigma=sigma))
+
+            sigma_win = float(np.std(cleaned_win[:, i]))
+            if sigma_win > 0:
+                rmss[i] = math.log(sigma_win)
+                _mu, sigma_noise = self.aux_baselines.get((sta_key, comp), (None, None))
+                if sigma_noise and sigma_noise > 0:
+                    snrs[i] = math.log(sigma_win / sigma_noise)
+        seq = np.stack(seqs, axis=-1).astype(np.float32)
+        aux = np.array(snrs + rmss, dtype=np.float32)   # (6,)
+
+        filename = stem + self.ext
+        torch.save({"seq": torch.from_numpy(seq), "img": s.contiguous().float(),
+                    "aux": torch.from_numpy(aux)}, out_dir / filename)
+        return filename
+
+
 def compute_station_spectral_baselines(
     noise_dir: str,
     n_fft: int = 256,

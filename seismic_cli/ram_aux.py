@@ -80,3 +80,48 @@ class RamAuxEncoder:
         filename = stem + self.ext
         torch.save({"img": torch.from_numpy(img), "aux": torch.from_numpy(aux)}, out_dir / filename)
         return filename
+
+
+AUX_FEATURES_PER_COMPONENT = ["log_snr_Z", "log_snr_N", "log_snr_E",
+                              "log_rms_Z", "log_rms_N", "log_rms_E"]
+
+
+class RamAuxEncoderV2(RamAuxEncoder):
+    """
+    `RamAuxEncoder` but aux is 6 per-component scalars instead of 2
+    Z/N/E-averaged ones: [log_snr_Z, log_snr_N, log_snr_E, log_rms_Z,
+    log_rms_N, log_rms_E]. `selection`'s order (Z, N, E -- see
+    core.select_components) is deterministic, so slot i always means the
+    same channel. Each slot defaults to 0.0 independently on missing data
+    (no station baseline / sigma_win <= 0 for that component), the natural
+    per-component generalization of the 2-scalar version's single collapsed
+    default.
+
+    Model side needs no changes: `RamAuxCNN`'s aux_dim is read from the
+    tensor's actual shape at load time, not hardcoded.
+    """
+
+    def __call__(self, cleaned_win, fs_station, sta_key, selection,
+                 station_baselines, out_dir, stem):
+        import torch
+
+        imgs = []
+        snrs = [0.0, 0.0, 0.0]
+        rmss = [0.0, 0.0, 0.0]
+        for i, comp in enumerate(selection):
+            R, _ = ram_matrix(cleaned_win[:, i], target_n=self.target_n)
+            imgs.append((np.clip(R, -np.pi, np.pi) + np.pi) / (2 * np.pi))
+
+            sigma_win = float(np.std(cleaned_win[:, i]))
+            if sigma_win > 0:
+                rmss[i] = math.log(sigma_win)
+                _mu, sigma_noise = self.station_baselines.get((sta_key, comp), (None, None))
+                if sigma_noise and sigma_noise > 0:
+                    snrs[i] = math.log(sigma_win / sigma_noise)
+
+        img = np.stack(imgs, axis=0).astype(np.float32)
+        aux = np.array(snrs + rmss, dtype=np.float32)   # (6,)
+
+        filename = stem + self.ext
+        torch.save({"img": torch.from_numpy(img), "aux": torch.from_numpy(aux)}, out_dir / filename)
+        return filename
