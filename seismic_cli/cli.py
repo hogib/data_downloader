@@ -604,6 +604,9 @@ def generate_riskclass_dataset_cmd(
     mag_threshold: float = typer.Option(4.0, help="Magnitude >= this is 02_high_risk, else 01_low_risk."),
     balance_ratio: float = typer.Option(4.0, help="Per split, caps 01_low_risk and 00_noise at "
                                         "ratio * count(02_high_risk); None-equivalent via a very large value."),
+    min_log_snr: float = typer.Option(-3.0, help="Reject windows whose RMS is below exp(min_log_snr) of "
+                                      "their station's own noise floor -- a stuck/dead instrument, not quiet "
+                                      "data. Pass a very negative value (e.g. -99) to disable."),
     window_seconds: float = typer.Option(3.0, help="Window length in seconds."),
     overlap: float = typer.Option(0.5, help="Sliding-window overlap fraction."),
     n_fft: int = typer.Option(256, help="FFT size (spectrogram encoding)."),
@@ -648,6 +651,7 @@ def generate_riskclass_dataset_cmd(
         eq_dir=eq_dir, noise_dir=noise_dir, catalog_path=catalog_path,
         output_dir=output_dir, encoder=encoder, station_catalog=station_catalog,
         mag_threshold=mag_threshold, balance_ratio=balance_ratio,
+        min_log_snr=min_log_snr,
         split_ratios=(train_ratio, val_ratio, test_ratio), fs=fs,
         window_seconds=window_seconds, overlap=overlap,
         max_windows_per_station=max_windows_per_station,

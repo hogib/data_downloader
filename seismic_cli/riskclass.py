@@ -33,6 +33,26 @@ level before encoding (not after), so windows that would be discarded are
 never encoded in the first place. This is deliberately not strict 1:1:1
 (which would throw away most of the abundant classes) and not full natural
 imbalance (which would swamp the rare class during training).
+
+**Dead-instrument rejection** (`--min-log-snr`, default -3.0). A window
+whose RMS is below `exp(-3) ~ 5%` of its own station's long-term noise
+baseline is rejected as an instrument fault, not kept as unusually quiet
+data. Genuine ambient noise does not sit 20x below the station's own noise
+floor; a recording that does is stuck, dead, or has had a gain change.
+
+This was found empirically and the criterion is worth stating precisely,
+because "drop the data the model gets wrong" would be cheating. Station
+`6G.MADM` contributed 199 noise windows whose raw traces span ~58 counts
+on a ~5.38-million-count DC offset with only ~50 unique values across
+30,001 samples -- a stuck digitizer, verified by reading the MiniSEED
+directly, not inferred from model error. Its RMS (~6 counts) against its
+own baseline (~975-3118) gives log_snr ~ -6. The pooled noise log_snr
+distribution has a clean gap here: 5th percentile -2.67, then an isolated
+cluster at -6.0. The threshold is applied uniformly to every class and
+every split, and is decided by the instrument physics plus that gap, not
+by which windows any model misclassifies. It also removes 18 earthquake
+windows, on the same reasoning -- a genuine event cannot be 20x quieter
+than its own station's noise floor either.
 """
 
 import concurrent.futures
@@ -64,7 +84,7 @@ MANIFEST_COLUMNS = ["split", "risk_class", "station_key", "event_id", "file_path
 def _process_earthquake_risk_file(args):
     (file_path, assignments, station_baselines, encoder, fs, window_seconds,
      overlap, max_gap_fraction, freqmin, freqmax, event_meta, station_coords,
-     mag_threshold) = args
+     mag_threshold, min_log_snr) = args
     from obspy import read
     try:
         st = read(str(file_path))
@@ -139,6 +159,9 @@ def _process_earthquake_risk_file(args):
                     if sigma_noise and sigma_noise > 0 and sigma_win > 0:
                         snrs.append(math.log(sigma_win / sigma_noise))
                 log_snr = float(np.mean(snrs)) if snrs else float("nan")
+                # Dead/stuck instrument -- see module docstring.
+                if min_log_snr is not None and snrs and log_snr < min_log_snr:
+                    continue
 
                 stem = f"{file_path.stem}_{sta_key}_win{w_idx:03d}"
                 filename = encoder(cleaned, fs_station, sta_key, selection,
@@ -152,7 +175,7 @@ def _process_earthquake_risk_file(args):
 
 def _process_noise_risk_file(args):
     (file_path, assignments, station_baselines, encoder, fs, window_seconds,
-     overlap, max_gap_fraction, freqmin, freqmax) = args
+     overlap, max_gap_fraction, freqmin, freqmax, min_log_snr) = args
     from obspy import read
     from seismic_cli.core import _masked_to_filled
     try:
@@ -216,6 +239,9 @@ def _process_noise_risk_file(args):
                     if sigma_noise and sigma_noise > 0 and sigma_win > 0:
                         snrs.append(math.log(sigma_win / sigma_noise))
                 log_snr = float(np.mean(snrs)) if snrs else float("nan")
+                # Dead/stuck instrument -- see module docstring.
+                if min_log_snr is not None and snrs and log_snr < min_log_snr:
+                    continue
 
                 stem = f"{file_path.stem}_{sta_key}_win{w_idx:03d}"
                 filename = encoder(cleaned, fs_station, sta_key, selection,
@@ -240,6 +266,7 @@ def run_riskclass_preprocessing(
     station_catalog: Optional[str] = None,
     mag_threshold: float = 4.0,
     balance_ratio: float = 4.0,
+    min_log_snr: Optional[float] = -3.0,
     split_ratios: tuple = (0.70, 0.15, 0.15),
     fs: float = 100.0,
     window_seconds: float = 3.0,
@@ -255,6 +282,9 @@ def run_riskclass_preprocessing(
     print("=" * 60)
     print(f"RISK-CLASS DATASET  (noise / <M{mag_threshold} / >=M{mag_threshold}, "
           f"balance-ratio {balance_ratio})")
+    if min_log_snr is not None:
+        print(f"  dead-instrument rejection: dropping windows with log_snr < {min_log_snr} "
+              f"(RMS below {100 * math.exp(min_log_snr):.1f}% of the station's own noise floor)")
     print("=" * 60)
 
     event_meta = load_event_catalog(catalog_path)
@@ -425,10 +455,11 @@ def run_riskclass_preprocessing(
         print("       (using 'spawn' workers -- required for torch-based encoders)")
 
     eq_tasks = [(fp, asg, station_baselines, encoder, fs, window_seconds, overlap,
-                max_gap_fraction, freqmin, freqmax, event_meta, station_coords, mag_threshold)
+                max_gap_fraction, freqmin, freqmax, event_meta, station_coords,
+                mag_threshold, min_log_snr)
                for fp, asg in eq_assignments.items()]
     no_tasks = [(fp, asg, station_baselines, encoder, fs, window_seconds, overlap,
-                max_gap_fraction, freqmin, freqmax)
+                max_gap_fraction, freqmin, freqmax, min_log_snr)
                for fp, asg in no_assignments.items()]
 
     manifest: List[tuple] = []
