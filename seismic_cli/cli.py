@@ -24,7 +24,7 @@ from typing import List, Optional
 import typer
 
 from seismic_cli import (anchor, catalog, eval_baseline, ram_aux, ram_dual,
-                         regression, spectrogram)
+                         regression, riskclass, spectrogram)
 from seismic_cli.core import (RamImageEncoder, compute_station_noise_baselines,
                               run_balanced_preprocessing)
 
@@ -588,6 +588,69 @@ def generate_regression_dataset_cmd(
         split_ratios=(train_ratio, val_ratio, test_ratio), fs=fs,
         window_seconds=window_seconds, overlap=overlap,
         max_windows_per_station=max_windows_per_station, split_by=split_by,
+        freqmin=freqmin, freqmax=freqmax, num_cores=num_cores, seed=seed,
+    )
+
+
+@app.command("generate-riskclass-dataset")
+def generate_riskclass_dataset_cmd(
+    eq_dir: str = typer.Option(..., help="Directory of earthquake mseed files."),
+    noise_dir: str = typer.Option(..., help="Noise mseed directory (its own class here, not just an amplitude reference)."),
+    catalog_path: str = typer.Option(..., help="Event catalog CSV with EventID + Magnitude (+ Latitude/Longitude)."),
+    output_dir: str = typer.Option(..., help="Where to write tensors + manifest.csv."),
+    station_catalog: Optional[str] = typer.Option(
+        None, help="Optional station CSV (network/station/latitude/longitude) enabling distance_km."),
+    encoding: str = typer.Option("spectrogram", help="spectrogram (.pt tensors) or ram (.png images)."),
+    mag_threshold: float = typer.Option(4.0, help="Magnitude >= this is 02_high_risk, else 01_low_risk."),
+    balance_ratio: float = typer.Option(4.0, help="Per split, caps 01_low_risk and 00_noise at "
+                                        "ratio * count(02_high_risk); None-equivalent via a very large value."),
+    window_seconds: float = typer.Option(3.0, help="Window length in seconds."),
+    overlap: float = typer.Option(0.5, help="Sliding-window overlap fraction."),
+    n_fft: int = typer.Option(256, help="FFT size (spectrogram encoding)."),
+    top_db: float = typer.Option(80.0, help="Dynamic-range clamp (spectrogram encoding)."),
+    normalize: str = typer.Option("station", help="Spectrogram normalization; see generate-spectrogram-dataset."),
+    target_n: int = typer.Option(64, help="RAM image resolution (ram encoding)."),
+    train_ratio: float = typer.Option(0.70),
+    val_ratio: float = typer.Option(0.15),
+    test_ratio: float = typer.Option(0.15),
+    max_windows_per_station: Optional[int] = typer.Option(None, help="Per-window cap on any single station."),
+    freqmin: float = typer.Option(1.0, help="Bandpass low corner (Hz)."),
+    freqmax: float = typer.Option(45.0, help="Bandpass high corner (Hz)."),
+    fs: float = typer.Option(100.0, help="Nominal sampling rate."),
+    seed: int = typer.Option(42),
+    num_cores: Optional[int] = typer.Option(None),
+):
+    """
+    Builds a three-class dataset (00_noise / 01_low_risk / 02_high_risk) from
+    earthquake + noise mseed: encoded windows plus, per window, the source
+    magnitude (NaN for noise) and the two physical predictors log SNR and
+    epicentral distance. Station-disjoint splits span all three classes
+    together (see riskclass.py's docstring for why this differs from
+    generate-regression-dataset's event-disjoint default).
+    """
+    if encoding == "spectrogram":
+        profiles = {}
+        if normalize == "station":
+            profiles = spectrogram.compute_station_spectral_baselines(
+                noise_dir, n_fft=n_fft, top_db=top_db, nominal_fs=fs,
+                freqmin=freqmin, freqmax=freqmax,
+            )
+        encoder = spectrogram.SpectrogramEncoder(
+            n_fft=n_fft, top_db=top_db, nominal_fs=fs, window_seconds=window_seconds,
+            normalize=normalize, noise_profiles=profiles,
+        )
+    elif encoding == "ram":
+        encoder = RamImageEncoder(target_n)
+    else:
+        raise typer.BadParameter("--encoding must be 'spectrogram' or 'ram'")
+
+    riskclass.run_riskclass_preprocessing(
+        eq_dir=eq_dir, noise_dir=noise_dir, catalog_path=catalog_path,
+        output_dir=output_dir, encoder=encoder, station_catalog=station_catalog,
+        mag_threshold=mag_threshold, balance_ratio=balance_ratio,
+        split_ratios=(train_ratio, val_ratio, test_ratio), fs=fs,
+        window_seconds=window_seconds, overlap=overlap,
+        max_windows_per_station=max_windows_per_station,
         freqmin=freqmin, freqmax=freqmax, num_cores=num_cores, seed=seed,
     )
 
