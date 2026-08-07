@@ -563,7 +563,7 @@ def _process_groundmotion_file(args):
         if meta is None:
             return []          # no catalog magnitude -> nothing to report
 
-        rows = []
+        rows, dropped = [], []
         for r in extract_event_file(file_path, cache_dir,
                                     label_seconds=label_seconds, want_input=True):
             arr = r.pop("_input_vel", None) if target == "vel" else r.pop("_input_acc", None)
@@ -571,7 +571,14 @@ def _process_groundmotion_file(args):
             r.pop("_input_acc", None)
             r.pop("_components", None)
             if arr is None:
-                continue       # response failed; no usable input tensor
+                # No response => no physical input tensor => not a usable row.
+                # COUNTED, not silently skipped: if these were merely dropped,
+                # the manifest's `response_ok` column would read 100 % by
+                # construction, since every failure was removed before the
+                # manifest was written. Reporting a rate over the survivors of
+                # that same filter is circular.
+                dropped.append(r["station_key"])
+                continue
 
             stem = f"{file_path.stem}_{r['station_key']}"
             torch.save(torch.from_numpy(np.ascontiguousarray(arr)),
@@ -585,7 +592,7 @@ def _process_groundmotion_file(args):
             r["distance_km"] = haversine_km(meta.get("lat"), meta.get("lon"),
                                             sta_lat, sta_lon)
             rows.append([r.get(c) for c in MANIFEST_COLUMNS])
-        return rows
+        return rows, dropped
     except Exception as e:
         return f"[WARN] Failed file {file_path.stem}: {e}"
 
@@ -691,6 +698,7 @@ def run_groundmotion_preprocessing(
               target, event_meta, station_coords) for f in labelled]
 
     manifest: List[list] = []
+    dropped_stations: Dict[str, int] = {}
     done = 0
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores) as ex:
         for res in ex.map(_process_groundmotion_file, tasks, chunksize=8):
@@ -698,7 +706,10 @@ def run_groundmotion_preprocessing(
             if isinstance(res, str):
                 print(res)
             elif res:
-                manifest.extend(res)
+                rows, dropped = res
+                manifest.extend(rows)
+                for k in dropped:
+                    dropped_stations[k] = dropped_stations.get(k, 0) + 1
             if done % 2000 == 0:
                 print(f"     ...{done}/{len(tasks)} records, {len(manifest)} windows")
 
@@ -712,10 +723,10 @@ def run_groundmotion_preprocessing(
         wr.writerow(MANIFEST_COLUMNS)
         wr.writerows(manifest)
 
-    report_groundmotion_manifest(manifest_path)
+    report_groundmotion_manifest(manifest_path, dropped_stations)
 
 
-def report_groundmotion_manifest(manifest_path) -> None:
+def report_groundmotion_manifest(manifest_path, dropped_stations=None) -> None:
     """
     Post-generation report. Deliberately leads with what is WRONG with the
     dataset -- response failures, clipping, untrustworthy sensitivities, and the
@@ -741,9 +752,28 @@ def report_groundmotion_manifest(manifest_path) -> None:
     print(f"\n  [leakage] events in more than one split: {shared} "
           f"(must be 0 -- the source term is shared across a whole event)")
 
-    print("\n  Quality flags:")
+    # Rows without a response produce no tensor, so they are not in the manifest
+    # at all. They must be reported HERE, from the generator's own count --
+    # `response_ok` measured over the manifest is 100 % by construction, because
+    # every failure was filtered out before the manifest existed. Same for
+    # `sens_mismatch`: the untrustworthy-sensitivity stations are largely the
+    # same ones that fail the response lookup, so both flags read perfect for
+    # the same circular reason.
     n = len(df)
-    for col, desc in (("response_ok", "usable instrument response"),
+    if dropped_stations:
+        n_drop = sum(dropped_stations.values())
+        by_net: Dict[str, int] = {}
+        for k, c in dropped_stations.items():
+            by_net[k.split(".")[0]] = by_net.get(k.split(".")[0], 0) + c
+        nets = ", ".join(f"{k} {v}" for k, v in sorted(by_net.items(), key=lambda x: -x[1]))
+        print(f"\n  Dropped BEFORE the manifest (no usable response, so no tensor):")
+        print(f"     {n_drop} windows across {len(dropped_stations)} stations "
+              f"({n_drop / max(n + n_drop, 1):.1%} of candidates)   by network: {nets}")
+        print( "     These are excluded from every rate below, so `response_ok` and")
+        print( "     `sens_mismatch` necessarily read 100 % / 0 % among survivors.")
+
+    print("\n  Quality flags (over manifest rows only -- see the drop count above):")
+    for col, desc in (("response_ok", "usable response (100% by construction)"),
                       ("clipped", "raw sample at the digitizer rail"),
                       ("peak_in_input", "true peak INSIDE the input window"),
                       ("pick_at_floor", "arrival not localized (STA/LTA floor)"),
