@@ -43,6 +43,30 @@ AUX_FEATURES = ["n_events", "log_duration_days", "log_rate", "mean_mag", "max_ma
 RISK_CLASSES = ["lt_1y", "1_5y", "gt_5y"]
 
 
+def _fmt_days(d: float) -> str:
+    """Compact, honest label for a boundary: days under a year, else years."""
+    if d < 365.0:
+        return f"{d:.0f}d"
+    y = d / 365.0
+    return f"{y:.0f}y" if abs(y - round(y)) < 0.05 else f"{y:.1f}y"
+
+
+def class_names_for(lo: float, hi: float) -> Tuple[str, str, str]:
+    """
+    Derives class names from the boundaries actually in force.
+
+    `RISK_CLASSES` above is only accurate when the boundaries really are 1 and
+    5 years. `assign_risk_classes` derives TERCILES by default, and on a
+    catalog whose mainshock recurrence is measured in weeks those terciles are
+    nowhere near a year -- on the pooled 4-region dataset they come out at 26 d
+    and 71 d, which made every window labelled `gt_5y` actually 71-817 days
+    out. Nothing crashed; the numbers were simply reported under names wrong by
+    more than an order of magnitude. Names are therefore generated from the
+    cut points instead of assumed.
+    """
+    return (f"lt_{_fmt_days(lo)}", f"{_fmt_days(lo)}_{_fmt_days(hi)}", f"gt_{_fmt_days(hi)}")
+
+
 # ---------------------------------------------------------------------------
 # Catalog loading
 # ---------------------------------------------------------------------------
@@ -600,13 +624,18 @@ def assign_risk_classes(parts: Dict[str, List[dict]],
               f"{boundaries[0]:.0f}-{boundaries[1]:.0f} d  |  > {boundaries[1]:.0f} d")
 
     lo, hi = float(boundaries[0]), float(boundaries[1])
+    names = class_names_for(lo, hi)
+    if list(names) != list(RISK_CLASSES):
+        print(f"[classes] labels: {names[0]} / {names[1]} / {names[2]}"
+              f"   (not the fixed {RISK_CLASSES[0]}/{RISK_CLASSES[1]}/{RISK_CLASSES[2]} names -- "
+              f"these boundaries are not at 1 and 5 years)")
     for split in parts:
         if split.startswith("_"):
             continue
         for w in parts[split]:
             d = w["days_to_major"]
-            w["risk_class"] = RISK_CLASSES[0] if d < lo else (
-                RISK_CLASSES[1] if d < hi else RISK_CLASSES[2])
+            w["risk_class"] = names[0] if d < lo else (
+                names[1] if d < hi else names[2])
     return (lo, hi)
 
 

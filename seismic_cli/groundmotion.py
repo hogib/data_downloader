@@ -69,6 +69,35 @@ something the paper never checks, because it never separates the two windows.
 `peak_rel_arrival_s` and `peak_in_input` are emitted per row so the split can be
 reported rather than assumed.
 
+**Consequence: the `_fwd` target is contaminated by S-P moveout, and this is
+measured, not suspected.** Fitting `log10(target) ~ a*M + b*log10(distance)`:
+
+    target               a (mag)   b (dist)   R2
+    log_pgv_full          +0.969     -1.455   0.476    <- textbook spreading
+    log_peak_input_vel    +0.864     -0.504   0.204
+    log_pgv_fwd           +1.021     +0.267   0.363    <- sign inverted
+
+`b` near -1 is what geometric spreading predicts, and `log_pgv_full` delivers
+it, so the station coordinates and the response correction are sound. The `_fwd`
+inversion has a specific cause: the input window closes at a FIXED +2.4 s while
+the S wave, which carries the peak, moves out with distance.
+
+    distance   peak_in_input   median peak_rel_arrival
+      22 km        34.0 %            -1.26 s      S is already inside the input
+      35 km        45.6 %            +0.42 s
+      47 km        16.5 %            +5.87 s
+      53 km        11.7 %            +7.09 s      S lands inside the fwd window
+
+corr(distance, peak_rel_arrival_s) = +0.492. So at near stations the forward
+window sees only coda, and at far stations it sees the whole S wave. That
+window-capture effect runs OPPOSITE to geometric spreading and, over this
+corpus's narrow 5-56 km range, it wins.
+
+`pgv_cms_fwd` is therefore not a clean ground-motion amplitude: it is partly a
+measurement of whether the S wave happened to land in the window, which is a
+distance question. Anything predicting it is partly predicting moveout. This is
+the central caveat on the forward task and the reason both targets are kept.
+
 --------------------------------------------------------------------------
 Quality flags -- recorded as columns, never silently absorbed
 --------------------------------------------------------------------------
@@ -115,10 +144,14 @@ record's start time. Nothing downstream noticed because the classifiers never
 used absolute time; it matters here because it destroys the arrival time.
 """
 
+import concurrent.futures
+import csv
 import math
+import multiprocessing
+import random
 import warnings
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -259,6 +292,10 @@ def _vector_magnitude(comps) -> np.ndarray:
     return np.sqrt(np.sum(stack ** 2, axis=1))
 
 
+def _log10(v: float) -> float:
+    return math.log10(v) if v == v and v > 0 else float("nan")
+
+
 def _peak_in(mag: np.ndarray, i0: int, i1: Optional[int] = None) -> float:
     i0 = max(0, i0)
     i1 = len(mag) if i1 is None else min(i1, len(mag))
@@ -272,6 +309,7 @@ def ground_motion_for_station(traces: Dict[str, Tuple[np.ndarray, np.ndarray, fl
                               arrival_sample: int,
                               starttime=None,
                               label_seconds: float = LABEL_SECONDS,
+                              want_input: bool = False,
                               pre_filt=(0.05, 0.1, 40.0, 45.0)) -> Optional[dict]:
     """
     PGA/PGV for one (event, station), plus the quality flags.
@@ -316,12 +354,19 @@ def ground_motion_for_station(traces: Dict[str, Tuple[np.ndarray, np.ndarray, fl
 
     # Input window is [arrival - 0.2*3s, arrival + 0.8*3s]; the forward label
     # opens where it closes.
+    # This must reproduce `anchor.slice_anchored_window` exactly -- including
+    # its clamp when the window overruns the record end -- or the input window
+    # here would not be the one stored in the anchored corpus.
     win = int(round(INPUT_SECONDS * fs))
     in_start = int(arrival_sample - PRE_ARRIVAL_FRACTION * win)
+    if in_start < 0:
+        return None
+    if in_start + win > n:
+        in_start = n - win
+        if in_start < 0:
+            return None
     in_end = in_start + win
     fwd_end = in_end + int(round(label_seconds * fs))
-    if in_start < 0 or in_end >= n:
-        return None
 
     masked_frac = float(np.mean(np.column_stack(masks)))
     peak_counts = float(max(np.max(np.abs(c)) for c in raw))
@@ -339,7 +384,8 @@ def ground_motion_for_station(traces: Dict[str, Tuple[np.ndarray, np.ndarray, fl
                label_truncated=bool(fwd_end > n),
                peak_rel_arrival_s=float("nan"), peak_in_input=False,
                pga_gal_fwd=float("nan"), pgv_cms_fwd=float("nan"),
-               pga_gal_full=float("nan"), pgv_cms_full=float("nan"))
+               pga_gal_full=float("nan"), pgv_cms_full=float("nan"),
+               log_peak_input_vel=float("nan"), log_peak_input_acc=float("nan"))
     if inv is None:
         return out
     out["sens_mismatch"] = sensitivity_mismatch(inv)
@@ -360,8 +406,10 @@ def ground_motion_for_station(traces: Dict[str, Tuple[np.ndarray, np.ndarray, fl
         return [t.data for t in st]
 
     try:
-        vel_mag = _vector_magnitude(_corrected("VEL"))
-        acc_mag = _vector_magnitude(_corrected("ACC"))
+        vel = _corrected("VEL")
+        acc = _corrected("ACC")
+        vel_mag = _vector_magnitude(vel)
+        acc_mag = _vector_magnitude(acc)
     except Exception:
         out["response_ok"] = False
         return out
@@ -370,6 +418,21 @@ def ground_motion_for_station(traces: Dict[str, Tuple[np.ndarray, np.ndarray, fl
     out["pga_gal_fwd"] = _peak_in(acc_mag, in_end, fwd_end) * M_S2_TO_GAL
     out["pgv_cms_full"] = _peak_in(vel_mag, 0) * M_S_TO_CMS
     out["pga_gal_full"] = _peak_in(acc_mag, 0) * M_S2_TO_GAL
+
+    # The model's input window, sliced from the SAME deconvolution rather than
+    # deconvolved separately: correcting a bare 3 s window would put taper and
+    # water-level artifacts right where the P onset is. Physical units, because
+    # a raw-count input against a physical target would force the model to infer
+    # each station's sensitivity -- the station-identity confound that removing
+    # the response exists to eliminate.
+    out["log_peak_input_vel"] = _log10(_peak_in(vel_mag, in_start, in_end) * M_S_TO_CMS)
+    out["log_peak_input_acc"] = _log10(_peak_in(acc_mag, in_start, in_end) * M_S2_TO_GAL)
+    if want_input:
+        out["_input_vel"] = np.asarray(
+            [c[in_start:in_end] for c in vel], dtype=np.float32) * M_S_TO_CMS
+        out["_input_acc"] = np.asarray(
+            [c[in_start:in_end] for c in acc], dtype=np.float32) * M_S2_TO_GAL
+        out["_components"] = "".join(sel)
 
     # Where the record's true peak sits relative to what the model sees. This
     # is the diagnostic that showed half the corpus peaks inside the input.
@@ -380,7 +443,8 @@ def ground_motion_for_station(traces: Dict[str, Tuple[np.ndarray, np.ndarray, fl
 
 
 def extract_event_file(file_path: Path, cache_dir: Path,
-                       label_seconds: float = LABEL_SECONDS) -> list:
+                       label_seconds: float = LABEL_SECONDS,
+                       want_input: bool = False) -> list:
     """
     All station labels from one `event_<EventID>_raw.mseed` (a 60 s record).
 
@@ -431,7 +495,8 @@ def extract_event_file(file_path: Path, cache_dir: Path,
         net, sta = key.split(".", 1)
         r = ground_motion_for_station(chans, net, sta, cache_dir, arrival,
                                       starttime=trs[0].stats.starttime,
-                                      label_seconds=label_seconds)
+                                      label_seconds=label_seconds,
+                                      want_input=want_input)
         if r is None:
             continue
         r["event_id"] = event_id
@@ -444,3 +509,303 @@ def extract_event_file(file_path: Path, cache_dir: Path,
             r[dst] = math.log10(v) if v == v and v > 0 else float("nan")
         rows.append(r)
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Dataset generation
+# ---------------------------------------------------------------------------
+
+# Columns written to manifest.csv, in order. Everything a baseline needs is
+# here, so `groundmotion_baselines.py` reads the manifest ONLY and never opens
+# a tensor -- the amplitude floor must not be more expensive to compute than
+# the network it is meant to keep honest.
+MANIFEST_COLUMNS = [
+    "split", "event_id", "station_key", "filename", "fs",
+    "magnitude", "distance_km",
+    # targets: forward (no overlap with the input) and full (the paper's)
+    "pga_gal_fwd", "pgv_cms_fwd", "log_pga_fwd", "log_pgv_fwd",
+    "pga_gal_full", "pgv_cms_full", "log_pga_full", "log_pgv_full",
+    # the critical baseline predictor -- peak of the input window itself
+    "log_peak_input_vel", "log_peak_input_acc",
+    # where the true peak sits relative to what the model saw
+    "peak_rel_arrival_s", "peak_in_input", "arrival_s",
+    "label_seconds", "label_truncated",
+    # quality flags, all label-independent
+    "pick_at_floor", "max_cft", "n_masked_frac", "clipped",
+    "response_ok", "sens_mismatch", "peak_counts",
+]
+
+
+def _scan_station_count(file_path: Path) -> Tuple[Path, int]:
+    """Cheap headonly count of stations with >=3 channels, for split balancing."""
+    from obspy import read
+    try:
+        st = read(str(file_path), headonly=True)
+    except Exception:
+        return file_path, 0
+    per: Dict[str, set] = {}
+    for tr in st:
+        per.setdefault(f"{tr.stats.network}.{tr.stats.station}", set()).add(
+            tr.stats.channel[-1].upper())
+    return file_path, sum(1 for c in per.values() if len(c) >= 3)
+
+
+def _process_groundmotion_file(args):
+    (file_path, split_name, out_dir, cache_dir, label_seconds, target,
+     event_meta, station_coords) = args
+    import torch
+
+    from seismic_cli.regression import haversine_km, parse_event_id, _station_coord
+
+    try:
+        event_id = parse_event_id(file_path.stem)
+        meta = event_meta.get(event_id)
+        if meta is None:
+            return []          # no catalog magnitude -> nothing to report
+
+        rows = []
+        for r in extract_event_file(file_path, cache_dir,
+                                    label_seconds=label_seconds, want_input=True):
+            arr = r.pop("_input_vel", None) if target == "vel" else r.pop("_input_acc", None)
+            r.pop("_input_vel", None)
+            r.pop("_input_acc", None)
+            r.pop("_components", None)
+            if arr is None:
+                continue       # response failed; no usable input tensor
+
+            stem = f"{file_path.stem}_{r['station_key']}"
+            torch.save(torch.from_numpy(np.ascontiguousarray(arr)),
+                       Path(out_dir) / f"{stem}.pt")
+
+            sta_lat, sta_lon = _station_coord(station_coords, r["station_key"])
+            r["filename"] = f"{stem}.pt"
+            r["split"] = split_name
+            r["fs"] = r.pop("sampling_rate")
+            r["magnitude"] = meta["magnitude"]
+            r["distance_km"] = haversine_km(meta.get("lat"), meta.get("lon"),
+                                            sta_lat, sta_lon)
+            rows.append([r.get(c) for c in MANIFEST_COLUMNS])
+        return rows
+    except Exception as e:
+        return f"[WARN] Failed file {file_path.stem}: {e}"
+
+
+def run_groundmotion_preprocessing(
+    eq_dir: str,
+    catalog_path: str,
+    output_dir: str,
+    cache_dir: str = "data/station_inventory",
+    station_catalog: Optional[str] = None,
+    split_ratios: tuple = (0.70, 0.15, 0.15),
+    target: str = "vel",
+    label_seconds: float = LABEL_SECONDS,
+    limit_files: Optional[int] = None,
+    num_cores: Optional[int] = None,
+    seed: int = 42,
+):
+    """
+    Build the peak-ground-motion dataset: response-corrected (3, 300) input
+    windows plus PGA/PGV labels, split so that whole events stay together.
+
+    **Splitting is by event, and not optionally.** The label is a property of
+    the (event, station) pair, but one earthquake recorded at twenty stations
+    produces twenty highly correlated targets driven by the same source. Putting
+    some in train and others in test leaks the source term directly -- the same
+    reasoning as `regression.py`, and the grouping the paper gives no evidence
+    of using.
+
+    `eq_dir` is the 60 s record directory, NOT the anchored 3 s one: the label
+    needs the part of the record that follows the input window, and the input
+    window itself is re-sliced here from the same deconvolution.
+    """
+    from seismic_cli.regression import load_event_catalog, load_station_coords, parse_event_id
+
+    if target not in ("vel", "acc"):
+        raise ValueError("target must be 'vel' or 'acc'")
+
+    print("=" * 66)
+    print(f"PEAK GROUND MOTION DATASET  (input={target}, label_seconds={label_seconds})")
+    print("=" * 66)
+
+    event_meta = load_event_catalog(catalog_path)
+    station_coords = load_station_coords(station_catalog)
+
+    splits = ["train", "val", "test"]
+    out_paths = {}
+    for s in splits:
+        d = Path(output_dir) / s
+        d.mkdir(parents=True, exist_ok=True)
+        out_paths[s] = d
+
+    if num_cores is None:
+        num_cores = max(1, multiprocessing.cpu_count() - 1)
+
+    eq_path = Path(eq_dir)
+    if not eq_path.exists():
+        print(f"[ERROR] Record directory not found: {eq_path}")
+        return
+    files = sorted(eq_path.rglob("*.mseed"))
+    if limit_files is not None:
+        files = files[:limit_files]
+        print(f"[info] --limit-files set: only the first {limit_files} file(s).")
+
+    print(f"\n[PHASE 1] Scanning {len(files)} records for station counts...")
+    counts: Dict[Path, int] = {}
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores) as ex:
+        for fp, c in ex.map(_scan_station_count, files, chunksize=32):
+            if c:
+                counts[fp] = c
+
+    labelled = {f: c for f, c in counts.items() if parse_event_id(f.stem) in event_meta}
+    total = sum(labelled.values())
+    print(f"  -> {len(labelled)} records carry a catalog magnitude "
+          f"({len(counts) - len(labelled)} dropped without one)")
+    print(f"  -> ~{total} candidate (event, station) windows")
+    if not labelled:
+        print("[ERROR] Nothing labelled. Check that catalog EventIDs match the "
+              "'event_<EventID>_raw.mseed' filenames.")
+        return
+
+    # ---- event-disjoint split ---------------------------------------------
+    print("\n[PHASE 2] Allocating event-disjoint splits...")
+    by_event: Dict[str, List[Path]] = {}
+    for f in labelled:
+        by_event.setdefault(parse_event_id(f.stem), []).append(f)
+
+    keys = sorted(by_event)
+    random.Random(seed).shuffle(keys)
+    targets = {s: r * total for s, r in zip(splits, split_ratios)}
+    running = {s: 0 for s in splits}
+    assign: Dict[Path, str] = {}
+    for k in keys:
+        # largest relative deficit first, so the ratios hold across the whole set
+        best = max(splits, key=lambda s: (targets[s] - running[s]) / max(targets[s], 1.0))
+        for f in by_event[k]:
+            assign[f] = best
+            running[best] += labelled[f]
+    for s in splits:
+        print(f"     {s:5s}: ~{running[s]} windows (target {targets[s]:.0f})")
+
+    print(f"\n[PHASE 3] Correcting responses and writing tensors on {num_cores} cores...")
+    tasks = [(f, assign[f], out_paths[assign[f]], Path(cache_dir), label_seconds,
+              target, event_meta, station_coords) for f in labelled]
+
+    manifest: List[list] = []
+    done = 0
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores) as ex:
+        for res in ex.map(_process_groundmotion_file, tasks, chunksize=8):
+            done += 1
+            if isinstance(res, str):
+                print(res)
+            elif res:
+                manifest.extend(res)
+            if done % 2000 == 0:
+                print(f"     ...{done}/{len(tasks)} records, {len(manifest)} windows")
+
+    if not manifest:
+        print("[ERROR] No windows were written.")
+        return
+
+    manifest_path = Path(output_dir) / "manifest.csv"
+    with open(manifest_path, "w", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(MANIFEST_COLUMNS)
+        wr.writerows(manifest)
+
+    report_groundmotion_manifest(manifest_path)
+
+
+def report_groundmotion_manifest(manifest_path) -> None:
+    """
+    Post-generation report. Deliberately leads with what is WRONG with the
+    dataset -- response failures, clipping, untrustworthy sensitivities, and the
+    fraction whose peak the model has already seen -- because every one of those
+    would otherwise show up much later as an inexplicable R2.
+    """
+    import pandas as pd
+
+    df = pd.read_csv(manifest_path)
+    print(f"\n[PHASE 4] Wrote {len(df)} windows to {manifest_path}")
+
+    print("\n  Per split:")
+    for s in ("train", "val", "test"):
+        sub = df[df.split == s]
+        if not len(sub):
+            print(f"     {s:5s}: EMPTY -- adjust ratios or add data")
+            continue
+        print(f"     {s:5s}: n={len(sub):6d}  events={sub.event_id.nunique():5d}  "
+              f"stations={sub.station_key.nunique():3d}  "
+              f"M {sub.magnitude.min():.1f}-{sub.magnitude.max():.1f}")
+
+    shared = sum(g.split.nunique() > 1 for _, g in df.groupby("event_id"))
+    print(f"\n  [leakage] events in more than one split: {shared} "
+          f"(must be 0 -- the source term is shared across a whole event)")
+
+    print("\n  Quality flags:")
+    n = len(df)
+    for col, desc in (("response_ok", "usable instrument response"),
+                      ("clipped", "raw sample at the digitizer rail"),
+                      ("peak_in_input", "true peak INSIDE the input window"),
+                      ("pick_at_floor", "arrival not localized (STA/LTA floor)"),
+                      ("label_truncated", "forward label shorter than requested")):
+        v = df[col].astype(bool)
+        print(f"     {col:16s} {int(v.sum()):6d}/{n} ({v.mean():6.1%})  {desc}")
+    bad = (df.sens_mismatch > SENS_MISMATCH_TOL)
+    print(f"     {'sens_mismatch':16s} {int(bad.sum()):6d}/{n} ({bad.mean():6.1%})  "
+          f"reported vs stage-gain sensitivity disagree > {SENS_MISMATCH_TOL:.0%}")
+
+    ok = df[df.response_ok.astype(bool) & (df.sens_mismatch <= SENS_MISMATCH_TOL)]
+    print(f"\n  Clean subset (response OK and trustworthy sensitivity): {len(ok)}/{n}")
+    if not len(ok):
+        return
+
+    print("\n  Target distributions on the clean subset:")
+    for c in ("pgv_cms_fwd", "pga_gal_fwd", "pgv_cms_full", "pga_gal_full"):
+        v = ok[c].dropna()
+        if len(v):
+            print(f"     {c:14s} median {v.median():10.4g}  "
+                  f"p01 {v.quantile(.01):9.3g}  p99 {v.quantile(.99):9.3g}  max {v.max():9.3g}")
+
+    _report_attenuation(ok)
+    print("\n[COMPLETE] Ground motion dataset ready.")
+
+
+def _report_attenuation(ok) -> None:
+    """
+    Fit `log10(target) ~ a*M + b*log10(distance)` per target.
+
+    The multivariate coefficient is the meaningful check, not a raw correlation:
+    distance and magnitude are entangled by detection (a distant small event is
+    never recorded), so the bare corr(target, distance) can carry either sign
+    for uninteresting reasons.
+
+    `a` should land near +1 (log amplitude scales with magnitude by definition)
+    and `b` should be near -1 for a direct-wave amplitude (geometric spreading).
+
+    `b` is expected to come out POSITIVE for the `_fwd` targets, and that is not
+    a bug -- see the S-P moveout note in the module docstring. It is reported
+    rather than flagged so the effect stays visible in every regeneration.
+    """
+    import numpy as np
+    from sklearn.linear_model import LinearRegression
+
+    print("\n  Attenuation fit  log10(target) ~ a*M + b*log10(distance):")
+    print(f"     {'target':20s} {'n':>6s} {'a (mag)':>9s} {'b (dist)':>9s} {'R2':>6s}")
+    d = ok.dropna(subset=["distance_km", "magnitude"]).copy()
+    d["log_dist"] = np.log10(d.distance_km.clip(lower=1.0))
+    for tcol in ("log_pgv_full", "log_pga_full", "log_pgv_fwd", "log_pga_fwd",
+                 "log_peak_input_vel"):
+        sub = d.dropna(subset=[tcol])
+        if len(sub) < 50:
+            continue
+        X = sub[["magnitude", "log_dist"]].to_numpy()
+        m = LinearRegression().fit(X, sub[tcol])
+        note = "  <- see S-P moveout note" if (tcol.endswith("_fwd") and m.coef_[1] > 0) else ""
+        print(f"     {tcol:20s} {len(sub):6d} {m.coef_[0]:+9.3f} {m.coef_[1]:+9.3f} "
+              f"{m.score(X, sub[tcol]):6.3f}{note}")
+
+    if "peak_rel_arrival_s" in d and d.distance_km.notna().any():
+        r = d.distance_km.corr(d.peak_rel_arrival_s)
+        print(f"\n     corr(distance, peak_rel_arrival_s) = {r:+.3f}   "
+              f"(S-P moveout; the input window closes at "
+              f"+{INPUT_SECONDS * (1 - PRE_ARRIVAL_FRACTION):.2f}s regardless of distance)")

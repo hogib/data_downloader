@@ -806,6 +806,49 @@ def forecast_now_cmd(
         typer.echo(f"\n[write] {output_csv}")
 
 
+@app.command("generate-groundmotion-dataset")
+def generate_groundmotion_dataset_cmd(
+    eq_dir: str = typer.Option(..., help="Directory of 60s raw records (NOT the anchored 3s ones)."),
+    catalog_path: str = typer.Option(..., help="Event catalog CSV with EventID + Magnitude (+ Latitude/Longitude)."),
+    output_dir: str = typer.Option(..., help="Where to write tensors + manifest.csv."),
+    cache_dir: str = typer.Option("data/station_inventory", help="StationXML cache; populated once, then offline."),
+    station_catalog: Optional[str] = typer.Option(
+        None, help="Station CSV (network/station/latitude/longitude) enabling distance_km."),
+    target: str = typer.Option("vel", help="Stored input tensor: vel (cm/s, native) or acc (gal)."),
+    label_seconds: float = typer.Option(
+        25.0, help="Forward label duration after the input window closes. Fixed rather than "
+                   "'to end of record' so the target does not depend on record length."),
+    train_ratio: float = typer.Option(0.70),
+    val_ratio: float = typer.Option(0.15),
+    test_ratio: float = typer.Option(0.15),
+    limit_files: Optional[int] = typer.Option(None, help="Process only the first N records (smoke test)."),
+    seed: int = typer.Option(42),
+    num_cores: Optional[int] = typer.Option(None),
+):
+    """
+    Builds the peak-ground-motion dataset for the Nurtas replication:
+    response-corrected (3, 300) input windows plus PGA/PGV labels.
+
+    Two targets are emitted per window. `*_fwd` is the peak strictly AFTER the
+    input window closes -- a genuine forecast. `*_full` is the peak over the
+    whole record, which is the paper's quantity but overlaps the input, so a
+    strong result on it is partly self-prediction. Roughly half this corpus has
+    its peak at or before the input closes, so the two differ substantially;
+    `peak_in_input` records which rows.
+
+    Splits keep whole events together: one earthquake at twenty stations gives
+    twenty correlated targets driven by the same source.
+    """
+    from seismic_cli.groundmotion import run_groundmotion_preprocessing
+
+    run_groundmotion_preprocessing(
+        eq_dir=eq_dir, catalog_path=catalog_path, output_dir=output_dir,
+        cache_dir=cache_dir, station_catalog=station_catalog,
+        split_ratios=(train_ratio, val_ratio, test_ratio), target=target,
+        label_seconds=label_seconds, limit_files=limit_files,
+        num_cores=num_cores, seed=seed,
+    )
+
 
 if __name__ == "__main__":
     app()
