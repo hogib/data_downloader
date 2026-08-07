@@ -221,3 +221,58 @@ def chronological_split(d: pd.DataFrame, horizon_days: float = 30.0,
         print(f"        {nm:5s} n={len(part):6d}  positive rate {part.label.mean():.3f}")
     print(f"        {dropped} windows dropped inside embargo bands")
     return train.copy(), val.copy(), test.copy()
+
+
+def zone_major_times(catalog_path: str, zone: str, threshold: float = 4.5) -> np.ndarray:
+    """Origin times of qualifying events inside one zone's bbox, sorted."""
+    la0, la1, lo0, lo1 = FAULT_ZONES[zone]
+    cat = load_catalog(catalog_path, min_magnitude=threshold)
+    sel = cat[cat.lat.between(la0, la1) & cat.lon.between(lo0, lo1)]
+    return np.sort(sel.time.to_numpy().astype("datetime64[ns]"))
+
+
+def build_blocks(d: pd.DataFrame, zone: str, horizon_days: float,
+                 catalog_end, major_times) -> pd.DataFrame:
+    """
+    Disjoint consecutive `horizon_days` blocks for one zone: one forecast and
+    one outcome each.
+
+    A block [t, t+H) is positive iff a qualifying event's ORIGIN TIME falls
+    inside it. Its forecast comes from the last window ending STRICTLY BEFORE t
+    -- the information a forecaster would actually hold when the block opens.
+
+    Outcomes come from `major_times` (the catalog) rather than from window
+    labels. Inheriting labels would be wrong: a window ending at
+    `block_start + 25d` carries a horizon reaching `block_start + 55d`, so
+    aggregating window labels marks a block positive for events happening up to
+    a full horizon AFTER it closes. That inflated every base rate by ~30 % in a
+    first version, and since the base rate is the reference for Brier skill and
+    information gain it moved the goalposts rather than the scores.
+
+    Shared by `cnn_earthquake/src/forecast_blocks.py` (evaluation) and
+    `forecast_now.py` (operational), so the two cannot drift apart.
+    """
+    g = d[d.region == zone].sort_values("end_time").reset_index(drop=True)
+    if g.empty:
+        return pd.DataFrame()
+
+    H = pd.Timedelta(days=horizon_days)
+    edges, t = [], g.end_time.min()
+    while t + H <= min(g.end_time.max(), catalog_end):
+        edges.append(t)
+        t = t + H
+
+    ends = g.end_time.to_numpy()
+    mt = np.sort(np.asarray(major_times, dtype="datetime64[ns]"))
+    rows = []
+    for lo in edges:
+        hi = lo + H
+        prior = np.searchsorted(ends, np.datetime64(lo), side="left") - 1
+        if prior < 0:
+            continue
+        i0 = np.searchsorted(mt, np.datetime64(lo), side="left")
+        i1 = np.searchsorted(mt, np.datetime64(hi), side="left")
+        rows.append({"region": zone, "block_start": lo, "block_end": hi,
+                     "fc_index": int(prior), "fc_time": g.end_time.iloc[prior],
+                     "label": int(i1 > i0), "n_major": int(i1 - i0)})
+    return pd.DataFrame(rows)
