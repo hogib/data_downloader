@@ -291,7 +291,7 @@ def run_riskclass_preprocessing(
     station_coords = load_station_coords(station_catalog)
     station_baselines, _ = compute_station_noise_baselines(
         noise_dir, fs=fs, freqmin=freqmin, freqmax=freqmax,
-        min_baseline_seconds=min_baseline_seconds,
+        min_baseline_seconds=min_baseline_seconds, num_cores=num_cores,
     )
 
     splits = ["train", "val", "test"]

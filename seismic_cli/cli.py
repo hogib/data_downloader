@@ -168,6 +168,7 @@ def generate_ram_aux_dataset_cmd(
 
     station_baselines, _ = compute_station_noise_baselines(
         noise_dir, fs=fs, freqmin=freqmin, freqmax=freqmax, min_baseline_seconds=min_baseline_seconds,
+        num_cores=num_cores,
     )
     if not station_baselines:
         print("[WARN] No station noise baselines built; log_snr will default to 0.0 for every window.")
@@ -388,6 +389,7 @@ def generate_spec_dual_aux_dataset_cmd(
 
     aux_baselines, _ = compute_station_noise_baselines(
         noise_dir, fs=fs, freqmin=freqmin, freqmax=freqmax, min_baseline_seconds=min_baseline_seconds,
+        num_cores=num_cores,
     )
     if not aux_baselines:
         print("[WARN] No station noise baselines built; log_snr will default to 0.0 for every window.")
@@ -513,6 +515,7 @@ def generate_dual_aux_dataset_cmd(
 
     aux_baselines, _ = compute_station_noise_baselines(
         noise_dir, fs=fs, freqmin=freqmin, freqmax=freqmax, min_baseline_seconds=min_baseline_seconds,
+        num_cores=num_cores,
     )
     if not aux_baselines:
         print("[WARN] No station noise baselines built; log_snr will default to 0.0 for every window.")
@@ -540,6 +543,13 @@ def generate_regression_dataset_cmd(
     station_catalog: Optional[str] = typer.Option(
         None, help="Optional station CSV (network/station/latitude/longitude) enabling distance_km."),
     encoding: str = typer.Option("spectrogram", help="spectrogram (.pt tensors) or ram (.png images)."),
+    dual: bool = typer.Option(
+        False, "--dual", help="Also write a raw-waveform 'seq' channel alongside the 2D image "
+                              "('img'), for the dual-channel CNN+LSTM architecture "
+                              "(cnn_earthquake's cnn_lstm_regression.py) instead of the "
+                              "single-channel CNN (cnn_regression.py/cnn_magclass.py). Forces "
+                              "--encoding's output to .pt regardless of choice, since RAM's "
+                              "single-channel .png path has no seq slot."),
     window_seconds: float = typer.Option(60.0, help="Window length in seconds."),
     overlap: float = typer.Option(0.5, help="Sliding-window overlap fraction."),
     split_by: str = typer.Option(
@@ -565,6 +575,14 @@ def generate_regression_dataset_cmd(
     depends on (log SNR against the station's noise floor, and epicentral
     distance). Splits keep whole events together by default, since the label
     is per-event.
+
+    --dual reuses the same {seq, img} encoders the detection pipeline already
+    has (SpectrogramDualEncoder / RamDualEncoder) -- they implement the exact
+    same per-window encoder protocol this orchestrator already calls, so no
+    new dataset-generation code is needed, only the choice of encoder. Train
+    the --dual output with cnn_earthquake's cnn_lstm_regression.py; the
+    single-channel (non-dual) output still trains with
+    cnn_regression.py/cnn_magclass.py as before.
     """
     if encoding == "spectrogram":
         profiles = {}
@@ -573,12 +591,14 @@ def generate_regression_dataset_cmd(
                 noise_dir, n_fft=n_fft, top_db=top_db, nominal_fs=fs,
                 freqmin=freqmin, freqmax=freqmax,
             )
-        encoder = spectrogram.SpectrogramEncoder(
+        spec_encoder = spectrogram.SpectrogramEncoder(
             n_fft=n_fft, top_db=top_db, nominal_fs=fs, window_seconds=window_seconds,
             normalize=normalize, noise_profiles=profiles,
         )
+        encoder = spectrogram.SpectrogramDualEncoder(spec_encoder) if dual else spec_encoder
     elif encoding == "ram":
-        encoder = RamImageEncoder(target_n)
+        encoder = (ram_dual.RamDualEncoder(target_n, nominal_fs=fs, window_seconds=window_seconds)
+                  if dual else RamImageEncoder(target_n))
     else:
         raise typer.BadParameter("--encoding must be 'spectrogram' or 'ram'")
 

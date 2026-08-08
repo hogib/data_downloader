@@ -233,12 +233,40 @@ def _accumulate_stats(existing: Optional[Tuple[float, float, int]], data: np.nda
     return (prev_s + s, prev_ss + ss, prev_n + n)
 
 
+def _scan_noise_file(args: Tuple[Path, float, float]) -> Dict[Tuple[str, str], Tuple[float, float, int]]:
+    """Per-file worker for `compute_station_noise_baselines`: returns this
+    file's own (sum, sum-of-squares, n) contribution per (station, component).
+    Module-level and picklable so it survives the ProcessPoolExecutor hand-off."""
+    file_path, freqmin, freqmax = args
+    out: Dict[Tuple[str, str], Tuple[float, float, int]] = {}
+    try:
+        st = read(str(file_path))
+        st.merge(method=1, fill_value='interpolate')
+    except Exception:
+        return out
+
+    for tr in st:
+        sta_key = f"{tr.stats.network}.{tr.stats.station}"
+        comp = tr.stats.channel[-1].upper()
+        try:
+            fs_actual = tr.stats.sampling_rate
+            data = tr.data.astype(np.float64)
+            if len(data) < int(fs_actual * 10):
+                continue
+            cleaned = clean_and_filter_1d(data, fs_actual, freqmin, freqmax)
+        except Exception:
+            continue
+        out[(sta_key, comp)] = _accumulate_stats(out.get((sta_key, comp)), cleaned)
+    return out
+
+
 def compute_station_noise_baselines(
     noise_dir: str,
     fs: float,
     freqmin: float,
     freqmax: float,
     min_baseline_seconds: float = 60.0,
+    num_cores: Optional[int] = None,
 ) -> Tuple[Dict[Tuple[str, str], Tuple[float, float]], int]:
     """
     Scans every noise mseed file, groups by (station_key, component), applies
@@ -247,6 +275,15 @@ def compute_station_noise_baselines(
     only gets a baseline if it accumulated at least `min_baseline_seconds`
     worth of usable noise data; otherwise it's left out and falls back to
     plain per-window self-standardization when used.
+
+    Fans out one task per file across a `ProcessPoolExecutor` -- this used to
+    be a single-threaded loop reading and filtering every noise file in the
+    main process, which on a large noise corpus (thousands of files, each a
+    full ObsPy read + merge + bandpass) dominated total dataset-generation
+    time on one core while the rest of the pipeline used all of them. The
+    per-file (sum, sum-of-squares, n) accumulation is associative, so merging
+    partial results from workers gives bit-identical baselines to the
+    sequential version.
     """
     noise_path = Path(noise_dir)
     if not noise_path.exists():
@@ -257,31 +294,23 @@ def compute_station_noise_baselines(
     mseed_files = list(noise_path.rglob("*.mseed"))
     print(f"  -> Found {len(mseed_files)} noise files to scan.")
 
+    if num_cores is None:
+        num_cores = max(1, multiprocessing.cpu_count() - 1)
+
     accum: Dict[Tuple[str, str], Tuple[float, float, int]] = {}
-
-    for i, file_path in enumerate(mseed_files, 1):
-        if i % 200 == 0:
-            print(f"  ...{i}/{len(mseed_files)} noise files processed")
-        try:
-            st = read(str(file_path))
-            st.merge(method=1, fill_value='interpolate')
-        except Exception:
-            continue
-
-        for tr in st:
-            sta_key = f"{tr.stats.network}.{tr.stats.station}"
-            comp = tr.stats.channel[-1].upper()
-            try:
-                fs_actual = tr.stats.sampling_rate
-                data = tr.data.astype(np.float64)
-                if len(data) < int(fs_actual * 10):
-                    continue
-                cleaned = clean_and_filter_1d(data, fs_actual, freqmin, freqmax)
-            except Exception:
-                continue
-
-            key = (sta_key, comp)
-            accum[key] = _accumulate_stats(accum.get(key), cleaned)
+    tasks = [(fp, freqmin, freqmax) for fp in mseed_files]
+    done = 0
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores) as ex:
+        for partial in ex.map(_scan_noise_file, tasks, chunksize=16):
+            done += 1
+            if done % 200 == 0:
+                print(f"  ...{done}/{len(mseed_files)} noise files processed")
+            for key, (s1, ss1, n1) in partial.items():
+                if key in accum:
+                    s0, ss0, n0 = accum[key]
+                    accum[key] = (s0 + s1, ss0 + ss1, n0 + n1)
+                else:
+                    accum[key] = (s1, ss1, n1)
 
     min_samples = int(min_baseline_seconds * fs)
     baselines: Dict[Tuple[str, str], Tuple[float, float]] = {}
@@ -597,6 +626,7 @@ def run_balanced_preprocessing(
     if use_baseline_standardization:
         station_baselines, _ = compute_station_noise_baselines(
             noise_dir, fs=fs, freqmin=freqmin, freqmax=freqmax, min_baseline_seconds=min_baseline_seconds,
+            num_cores=num_cores,
         )
     else:
         station_baselines = {}

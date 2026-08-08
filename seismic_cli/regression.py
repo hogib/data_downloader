@@ -144,10 +144,43 @@ def _station_coord(coords, sta_key):
 # ---------------------------------------------------------------------------
 # Per-file worker
 # ---------------------------------------------------------------------------
+#
+# The read-only data shared by every task (event_meta, station_coords,
+# station_baselines, encoder, and the scalar options) is set ONCE per worker
+# process via `_init_regression_worker`, an `initializer=` passed to
+# ProcessPoolExecutor -- not threaded through each task's arguments. On the
+# real catalog, `event_meta` alone (every event with a usable magnitude, no
+# magnitude floor applied here) is ~480k entries / ~22 MB pickled; passing it
+# inside every one of ~31k per-file tasks means `ex.map` pickles and unpickles
+# that blob 31k times over IPC (~0.2s to pickle ALONE, before unpickling or
+# the queue itself), which dominates total runtime by orders of magnitude
+# over the actual per-window encoding cost (sub-millisecond once a worker's
+# lazy torch/torchaudio import has run once). An `initializer` sends each
+# large object to each worker exactly once, at process startup.
+
+_worker: Dict[str, object] = {}
+
+
+def _init_regression_worker(station_baselines, encoder, fs, window_seconds, overlap,
+                            max_gap_fraction, freqmin, freqmax, event_meta, station_coords):
+    _worker.update(station_baselines=station_baselines, encoder=encoder, fs=fs,
+                   window_seconds=window_seconds, overlap=overlap,
+                   max_gap_fraction=max_gap_fraction, freqmin=freqmin, freqmax=freqmax,
+                   event_meta=event_meta, station_coords=station_coords)
+
 
 def _process_regression_file(args):
-    (file_path, assignments, station_baselines, encoder, fs, window_seconds,
-     overlap, max_gap_fraction, freqmin, freqmax, event_meta, station_coords) = args
+    file_path, assignments = args
+    station_baselines = _worker["station_baselines"]
+    encoder = _worker["encoder"]
+    fs = _worker["fs"]
+    window_seconds = _worker["window_seconds"]
+    overlap = _worker["overlap"]
+    max_gap_fraction = _worker["max_gap_fraction"]
+    freqmin = _worker["freqmin"]
+    freqmax = _worker["freqmax"]
+    event_meta = _worker["event_meta"]
+    station_coords = _worker["station_coords"]
     from obspy import read
     try:
         st = read(str(file_path))
@@ -269,7 +302,7 @@ def run_regression_preprocessing(
     # Amplitude reference: reuse the classifier's station noise baselines.
     station_baselines, _ = compute_station_noise_baselines(
         noise_dir, fs=fs, freqmin=freqmin, freqmax=freqmax,
-        min_baseline_seconds=min_baseline_seconds,
+        min_baseline_seconds=min_baseline_seconds, num_cores=num_cores,
     )
 
     splits = ["train", "val", "test"]
@@ -364,13 +397,16 @@ def run_regression_preprocessing(
     if mp_context:
         print("       (using 'spawn' workers -- required for torch-based encoders)")
 
-    tasks = [(fp, asg, station_baselines, encoder, fs, window_seconds, overlap,
-              max_gap_fraction, freqmin, freqmax, event_meta, station_coords)
-             for fp, asg in file_assignments.items()]
+    tasks = [(fp, asg) for fp, asg in file_assignments.items()]
+    init_args = (station_baselines, encoder, fs, window_seconds, overlap,
+                max_gap_fraction, freqmin, freqmax, event_meta, station_coords)
 
     manifest: List[tuple] = []
-    with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores, mp_context=mp_context) as ex:
-        for res in ex.map(_process_regression_file, tasks):
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=num_cores, mp_context=mp_context,
+        initializer=_init_regression_worker, initargs=init_args,
+    ) as ex:
+        for res in ex.map(_process_regression_file, tasks, chunksize=16):
             if isinstance(res, str):
                 print(res)
             elif res:
