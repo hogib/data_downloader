@@ -4,9 +4,10 @@
 
 *Companion documents: `cnn_earthquake/report.md` (full investigation),
 `accuracy_summary.md` (results), `spectrogram_classifier_report.md` (best
-detector), `catalog_report.md` (forecasting). This one covers only how the
-data is built. Section references of the form "§12 defect N" point at
-`report.md`'s defect changelog.*
+detector). Catalog forecasting (formerly `catalog_report.md`) is being
+redone against a neural architecture; see `report.md` §11. This one covers
+only how the data is built. Section references of the form "§12 defect N"
+point at `report.md`'s defect changelog.*
 
 ---
 
@@ -282,7 +283,8 @@ slide out of it, and the code says so explicitly with remediation options.
 > were hardcoded `lt_1y / 1_5y / gt_5y` while `assign_risk_classes` derives
 > *terciles*. On the pooled catalog those land at 26 d and 71 d — so `gt_5y`
 > actually meant 71–817 **days**. Names are now generated from the boundaries in
-> force. See `catalog_report.md` §2.
+> force. (Previously documented in the now-removed `catalog_report.md` §2; the
+> fix itself is unaffected and still in force in `catalog.py`.)
 
 ## 7. Command reference
 

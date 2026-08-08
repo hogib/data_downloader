@@ -1,13 +1,22 @@
 """
-Regional earthquake forecasting: will a M >= threshold event occur in this
-fault zone within the next N days?
+Regional earthquake forecasting: shared target/data infrastructure for "will a
+M >= threshold event occur in this fault zone within the next N days?"
+
+**This module builds the dataset; it does not fit a model.** An earlier
+sklearn-based forecaster (logistic regression / gradient boosting) built on
+top of this module measured a real but weak signal in 2 of 4 zones and has
+since been retired -- it didn't meet this project's neural-architecture
+mandate. This module's target definition, feature set, and split logic
+survived that retirement and are now consumed by a neural model instead
+(`cnn_earthquake/src/cnn_lstm.py` / `cnn_lstm_loeo.py`, retargeted onto the
+dense label defined here rather than the abandoned three-class one).
 
 **Why this replaces the time-to-next-mainshock formulation.** `catalog.py`
 labels each window with the time until the next independent mainshock, binned
 into terciles. Measured under 264-event leave-one-event-out CV, a gradient
 boosted model over its nine seismicity indicators scores 31.49 % accuracy
 against a 33.33 % chance floor, with kappa -0.028 -- at chance, with a
-near-uniform confusion matrix (see `cnn_earthquake/catalog_report.md`).
+near-uniform confusion matrix.
 
 There is a structural reason to expect that. Gardner-Knopoff declustering
 removes aftershocks *for target selection*, and aftershock sequences are the
@@ -249,8 +258,11 @@ def build_blocks(d: pd.DataFrame, zone: str, horizon_days: float,
     first version, and since the base rate is the reference for Brier skill and
     information gain it moved the goalposts rather than the scores.
 
-    Shared by `cnn_earthquake/src/forecast_blocks.py` (evaluation) and
-    `forecast_now.py` (operational), so the two cannot drift apart.
+    Any evaluation of the retargeted neural model
+    (`cnn_earthquake/src/cnn_lstm.py` / `cnn_lstm_loeo.py`) should call this
+    directly rather than scoring raw per-window predictions -- consecutive
+    windows overlap 11-46x, so per-window AUC overstates confidence by up to
+    ~7x in its standard error.
     """
     g = d[d.region == zone].sort_values("end_time").reset_index(drop=True)
     if g.empty:

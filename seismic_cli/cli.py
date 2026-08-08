@@ -773,39 +773,6 @@ def eval_sta_lta_cmd(
 
 
 
-@app.command("forecast-now")
-def forecast_now_cmd(
-    catalog_path: str = typer.Option(..., help="Earthquake catalog CSV (AFAD/Kandilli export)."),
-    threshold: float = typer.Option(4.5, help="Magnitude defining a qualifying event."),
-    horizon_days: float = typer.Option(30.0, help="Forecast horizon in days."),
-    window_events: int = typer.Option(64, help="Events per sliding window."),
-    stride_events: int = typer.Option(8, help="Events advanced between windows."),
-    zone: List[str] = typer.Option([], "--zone", "-z", help="Restrict to these zones. Repeatable."),
-    output_csv: Optional[str] = typer.Option(None, help="Also write the table here."),
-):
-    """
-    Probability of a qualifying event per fault zone over the next N days.
-
-    Probabilities are Platt-calibrated against each zone's own historical
-    blocks; raw model scores are never surfaced, because the uncalibrated model
-    ranks above chance while emitting probabilities WORSE than climatology
-    (catalog_report.md 4.8).
-
-    Only EAFZ has skill worth acting on. AEGEAN ranks above chance but its
-    calibrated probabilities sit within 0.005 Brier skill of climatology; NAFZ
-    and CENTRAL are indistinguishable from chance. All four are printed with
-    their measured status rather than the unusable ones being hidden.
-    """
-    from seismic_cli.forecast_now import run_forecast_now
-
-    out = run_forecast_now(catalog_path, threshold=threshold, horizon_days=horizon_days,
-                           window_events=window_events, stride_events=stride_events,
-                           zones=list(zone) or None)
-    if output_csv:
-        out.to_csv(output_csv, index=False)
-        typer.echo(f"\n[write] {output_csv}")
-
-
 @app.command("generate-groundmotion-dataset")
 def generate_groundmotion_dataset_cmd(
     eq_dir: str = typer.Option(..., help="Directory of 60s raw records (NOT the anchored 3s ones)."),
