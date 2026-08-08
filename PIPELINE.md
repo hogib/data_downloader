@@ -4,10 +4,10 @@
 
 *Companion documents: `cnn_earthquake/report.md` (full investigation),
 `accuracy_summary.md` (results), `spectrogram_classifier_report.md` (best
-detector). Catalog forecasting (formerly `catalog_report.md`) is being
-redone against a neural architecture; see `report.md` §11. This one covers
-only how the data is built. Section references of the form "§12 defect N"
-point at `report.md`'s defect changelog.*
+detector), `catalog_forecast_report.md` (catalog forecasting, redone against
+a neural architecture; supersedes the removed `catalog_report.md`). This one
+covers only how the data is built. Section references of the form "§12
+defect N" point at `report.md`'s defect changelog.*
 
 ---
 
@@ -301,6 +301,7 @@ slide out of it, and the code says so explicitly with remediation options.
 | `generate-regression-dataset` | `regression.py` | spectrogram or RAM | `.pt` + magnitude | **event** |
 | `generate-riskclass-dataset` | `riskclass.py` | spectrogram or RAM | `.pt` + 3-class | station (all 3 classes) |
 | `generate-catalog-dataset` | `catalog.py` | *(direct write)* | `{seq,img,aux}` | **chronological / LOEO** |
+| `generate-catalog-forecast-dataset` | `catalog.py` | *(direct write)* | `{seq,img,aux}` + dense binary label | **chronological, horizon-embargo** |
 | `eval-sta-lta` | `eval_baseline.py` | — | baseline metrics | — |
 
 The seven station-split commands share one orchestrator and differ only by

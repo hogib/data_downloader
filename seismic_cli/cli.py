@@ -23,8 +23,8 @@ from typing import List, Optional
 
 import typer
 
-from seismic_cli import (anchor, catalog, eval_baseline, ram_aux, ram_dual,
-                         regression, riskclass, spectrogram)
+from seismic_cli import (anchor, catalog, eval_baseline, forecast, ram_aux,
+                         ram_dual, regression, riskclass, spectrogram)
 from seismic_cli.core import (RamImageEncoder, compute_station_noise_baselines,
                               run_balanced_preprocessing)
 
@@ -738,6 +738,50 @@ def generate_catalog_dataset_cmd(
         class_boundaries=((class_lo_days, class_hi_days)
                           if None not in (class_lo_days, class_hi_days) else None),
         decluster=decluster,
+    )
+
+
+@app.command("generate-catalog-forecast-dataset")
+def generate_catalog_forecast_dataset_cmd(
+    catalog_path: str = typer.Option(..., help="Earthquake catalog CSV (AFAD/Kandilli export)."),
+    output_dir: str = typer.Option(..., help="Where to write window tensors + manifest.csv."),
+    window_events: int = typer.Option(64, help="Events per sliding window (fixed length)."),
+    stride_events: int = typer.Option(8, help="Events advanced between consecutive windows."),
+    threshold: float = typer.Option(4.5, help="Magnitude defining a qualifying event."),
+    horizon_days: float = typer.Option(30.0, help="Forecast horizon in days."),
+    min_magnitude: float = typer.Option(2.0, help="Drop catalog events below this magnitude."),
+    target_n: int = typer.Option(32, help="RAM image resolution for the 2D channel."),
+    zone: List[str] = typer.Option(
+        [], "--zone", "-z",
+        help="Restrict to these fault zones (default: all of forecast.FAULT_ZONES: "
+             "NAFZ, EAFZ, AEGEAN, CENTRAL). Repeatable."),
+    train_ratio: float = typer.Option(0.70), val_ratio: float = typer.Option(0.15),
+    test_ratio: float = typer.Option(0.15),
+):
+    """
+    Builds the dual-channel {seq, img, aux} dataset for the DENSE per-zone
+    forecasting target ("will M >= threshold occur in this zone within
+    horizon_days?") instead of `generate-catalog-dataset`'s abandoned
+    time-to-next-major tercile target (measured at chance, kappa -0.028; see
+    report.md). This is the target forecast.py validated real signal for in
+    2 of 4 zones under logistic regression -- never previously tried against
+    the dual-channel network. Train the result with
+    cnn_earthquake/src/cnn_lstm_forecast.py.
+    """
+    if zone:
+        unknown = [z for z in zone if z not in forecast.FAULT_ZONES]
+        if unknown:
+            raise typer.BadParameter(
+                f"Unknown zone(s) {unknown}; choices are {list(forecast.FAULT_ZONES)}")
+        zones = {z: forecast.FAULT_ZONES[z] for z in zone}
+    else:
+        zones = forecast.FAULT_ZONES
+
+    catalog.run_catalog_forecast_dataset(
+        catalog_path=catalog_path, output_dir=output_dir, zones=zones,
+        min_magnitude=min_magnitude, window_events=window_events,
+        stride_events=stride_events, threshold=threshold, horizon_days=horizon_days,
+        target_n=target_n, ratios=(train_ratio, val_ratio, test_ratio),
     )
 
 

@@ -793,3 +793,290 @@ def run_catalog_dataset(catalog_path: str, output_dir: str, window_events: int =
     assign_risk_classes(parts, class_boundaries)
     encode_and_write(parts, output_dir, target_n=target_n)
     print("\n[COMPLETE] Catalog window dataset ready.")
+
+
+# ---------------------------------------------------------------------------
+# Dense per-zone forecasting target (the validated one; see forecast.py)
+# ---------------------------------------------------------------------------
+#
+# Everything above targets "days until the next independent mainshock",
+# binned into terciles -- measured at chance (cnn_earthquake/report.md's
+# catalog work, kappa -0.028). `seismic_cli/forecast.py` reformulated the
+# target as dense ("will M >= threshold occur in this zone within
+# horizon_days?") and validated real signal in 2 of 4 zones under logistic
+# regression. The functions below produce the SAME {seq, img, aux} tensor
+# shape the dual-channel model already expects, but windowed and labelled
+# by that dense rule instead, so `cnn_lstm_forecast.py` can test whether the
+# network beats the scalar floor on a target that is actually learnable --
+# never tried, since the network was only ever run against the abandoned
+# tercile target.
+
+DENSE_AUX_FEATURES = ["log_duration_days", "log_rate", "log_rate_recent", "rate_accel",
+                      "mean_mag", "max_mag", "mag_std", "log_total_energy",
+                      "log_energy_recent_frac", "b_value", "days_since_prev_major"]
+
+
+def build_dense_windows(df: pd.DataFrame, region_label: str,
+                        bbox: Tuple[float, float, float, float],
+                        window_events: int = 64, stride_events: int = 8,
+                        threshold: float = 4.5, horizon_days: float = 30.0) -> List[dict]:
+    """
+    Sliding fixed-event-count window labelled with the DENSE target: does a
+    M >= threshold event occur within horizon_days of the window's last event?
+
+    Two deliberate differences from `build_windows`, both load-bearing for why
+    this target is learnable where the tercile one wasn't (see forecast.py):
+
+    * No declustering. A clustered aftershock sequence is exactly the
+      precursor signal this task wants to detect, not noise to be defined
+      away -- the opposite choice from the tercile target's TARGET selection
+      (features there also keep dependent events; only target selection
+      declustered).
+    * Windows are not dropped for containing a M >= threshold event. The
+      label only looks at events strictly AFTER the window's end, so a large
+      event inside the window is a feature (recent activity), not an answer
+      leaking into its own input.
+
+    Produces the same seq/aux dict shape `build_windows` does -- same
+    per-event sequence features, same RAM-image path -- so only the
+    windowing/labelling rule and the aux feature set differ. aux uses
+    `DENSE_AUX_FEATURES` (forecast.py's validated set: adds
+    `days_since_prev_major` and rate/energy-acceleration terms, drops the old
+    `n_events`, which is constant by construction).
+    """
+    rdf = filter_region(df, bbox=bbox)
+    if len(rdf) < window_events * 2:
+        print(f"[SKIP] {region_label}: only {len(rdf)} events after filtering, need at least "
+              f"{window_events * 2}.")
+        return []
+
+    t = rdf.time.to_numpy()
+    mag = rdf.magnitude.to_numpy(dtype=np.float64)
+    lat, lon = rdf.lat.to_numpy(dtype=np.float64), rdf.lon.to_numpy(dtype=np.float64)
+    depth = rdf.depth.to_numpy(dtype=np.float64)
+    energy = energy_joules(mag)
+
+    major_times = t[mag >= threshold]           # NOT declustered -- see docstring
+    if len(major_times) == 0:
+        print(f"[SKIP] {region_label}: no M >= {threshold} events in this region.")
+        return []
+    catalog_end = t[-1]
+    horizon = np.timedelta64(int(horizon_days), "D")
+
+    out = []
+    n = len(rdf)
+    for start in range(0, n - window_events + 1, stride_events):
+        sl = slice(start, start + window_events)
+        wt, wmag, we = t[sl], mag[sl], energy[sl]
+        end_time = wt[-1]
+
+        if end_time + horizon > catalog_end:
+            continue                            # unknowable: horizon runs past the catalog
+
+        dt_days = np.diff(wt) / np.timedelta64(1, "D")
+        dt_days = np.concatenate([[np.median(dt_days) if len(dt_days) else 1.0], dt_days])
+        dt_days = np.clip(dt_days, 1e-4, None)
+
+        wlat, wlon = lat[sl], lon[sl]
+        clat = float(np.nanmean(wlat)) if np.isfinite(wlat).any() else 0.0
+        clon = float(np.nanmean(wlon)) if np.isfinite(wlon).any() else 0.0
+        dist = np.nan_to_num(haversine_km(wlat, wlon, clat, clon), nan=0.0)
+
+        seq = {
+            "magnitude": wmag,
+            "log_dt": np.log10(dt_days),
+            "depth": np.nan_to_num(depth[sl], nan=10.0),
+            "log_energy": np.log10(we),
+            "cum_energy_frac": np.cumsum(we) / max(float(np.sum(we)), 1e-12),
+            "dist_km": dist,
+        }
+
+        dur = max(float((wt[-1] - wt[0]) / np.timedelta64(1, "D")), 1e-3)
+        q = max(window_events // 4, 2)
+        dur_recent = max(float((wt[-1] - wt[-q]) / np.timedelta64(1, "D")), 1e-3)
+        prev = major_times[major_times < end_time]
+        days_since = (float((end_time - prev[-1]) / np.timedelta64(1, "D"))
+                     if len(prev) else np.nan)
+        e_tot = max(float(np.sum(we)), 1e-12)
+        e_recent = max(float(np.sum(we[-q:])), 1e-12)
+        log_rate = math.log10(window_events / dur)
+        log_rate_recent = math.log10(q / dur_recent)
+
+        aux = {
+            "log_duration_days": math.log10(dur),
+            "log_rate": log_rate,
+            "log_rate_recent": log_rate_recent,
+            "rate_accel": log_rate_recent - log_rate,
+            "mean_mag": float(np.mean(wmag)),
+            "max_mag": float(np.max(wmag)),
+            "mag_std": float(np.std(wmag)),
+            "log_total_energy": math.log10(e_tot),
+            "log_energy_recent_frac": math.log10(e_recent / e_tot),
+            "b_value": b_value_aki(wmag),
+            "days_since_prev_major": days_since,
+        }
+
+        fut = major_times[(major_times > end_time) & (major_times <= end_time + horizon)]
+        out.append({
+            "start_idx": start,
+            "start_time": pd.Timestamp(wt[0]),
+            "end_time": pd.Timestamp(end_time),
+            "region": region_label,
+            "seq": seq,
+            "aux": aux,
+            "label": int(len(fut) > 0),
+        })
+
+    pos = np.mean([w["label"] for w in out]) if out else float("nan")
+    print(f"[windows:{region_label}] {len(out)} dense-target windows "
+          f"(M>={threshold} within {horizon_days:.0f}d), positive rate {pos:.3f}")
+    return out
+
+
+def pool_dense_zones(df: pd.DataFrame, zones: Dict[str, Tuple[float, float, float, float]],
+                     window_events: int = 64, stride_events: int = 8,
+                     threshold: float = 4.5, horizon_days: float = 30.0) -> List[dict]:
+    """Builds dense-target windows independently per zone (see `pool_regions` for why
+    per-zone rather than pooled-then-windowed) and concatenates them."""
+    all_windows: List[dict] = []
+    print(f"\n[pool:dense] {len(zones)} zone(s), M>={threshold} within {horizon_days:.0f}d")
+    for name, bbox in zones.items():
+        all_windows.extend(build_dense_windows(df, name, bbox, window_events, stride_events,
+                                               threshold, horizon_days))
+    pos = np.mean([w["label"] for w in all_windows]) if all_windows else float("nan")
+    print(f"[pool:dense] {len(all_windows)} total windows, positive rate {pos:.3f}")
+    return all_windows
+
+
+def dense_chronological_split(windows: List[dict], ratios=(0.70, 0.15, 0.15),
+                              horizon_days: float = 30.0) -> Dict[str, List[dict]]:
+    """
+    Time-ordered split for the dense target.
+
+    Every window's label looks forward EXACTLY horizon_days from its
+    end_time -- unlike `chronological_split`'s label-aware rule, which needs a
+    specific target_time per window, a flat horizon-wide embargo at each
+    boundary is exactly right here and is guaranteed to remove every window
+    whose label could reach across it. Matches `forecast.py`'s
+    `chronological_split`, under which this target was validated.
+    """
+    ws = sorted(windows, key=lambda w: w["end_time"])
+    times = [w["end_time"] for w in ws]
+    t0, t1 = times[0], times[-1]
+    span = (t1 - t0).total_seconds() / 86400.0
+    cut_train = t0 + pd.Timedelta(days=span * ratios[0])
+    cut_val = t0 + pd.Timedelta(days=span * (ratios[0] + ratios[1]))
+    emb = pd.Timedelta(days=horizon_days)
+
+    parts = {"train": [], "val": [], "test": [], "_dropped": []}
+    for w in ws:
+        e = w["end_time"]
+        if e <= cut_train - emb:
+            parts["train"].append(w)
+        elif cut_train < e <= cut_val - emb:
+            parts["val"].append(w)
+        elif e > cut_val:
+            parts["test"].append(w)
+        else:
+            parts["_dropped"].append(w)
+
+    print(f"\n[split] dense chronological, {horizon_days:.0f}-day horizon embargo")
+    print(f"        train <= {cut_train.date()}  |  val <= {cut_val.date()}  |  "
+          f"test > {cut_val.date()}")
+    for s in ("train", "val", "test"):
+        pos = np.mean([w["label"] for w in parts[s]]) if parts[s] else float("nan")
+        print(f"        {s:5s}: n={len(parts[s]):6d}  positive rate {pos:.3f}")
+    print(f"        {len(parts['_dropped'])} windows dropped inside embargo bands")
+    return parts
+
+
+def encode_and_write_dense(parts: Dict[str, List[dict]], output_dir: str, target_n: int = 32,
+                           seq_features: Sequence[str] = SEQ_FEATURES,
+                           image_features: Sequence[str] = IMAGE_FEATURES,
+                           aux_features: Sequence[str] = DENSE_AUX_FEATURES) -> None:
+    """Same tensor-writing path as `encode_and_write`, but manifest rows carry
+    a binary `label` column instead of `days_to_major`/`risk_class`."""
+    import torch
+
+    from seismic_cli.core import ram_matrix, to_uint8
+
+    root = Path(output_dir)
+    split_names = [s for s in parts if not s.startswith("_")]
+    rows = []
+    for split in split_names:
+        d = root / split
+        d.mkdir(parents=True, exist_ok=True)
+        for i, w in enumerate(parts[split]):
+            seq = np.stack([w["seq"][f] for f in seq_features], axis=-1).astype(np.float32)
+
+            chans = []
+            for f in image_features:
+                R, _ = ram_matrix(w["seq"][f].astype(np.float64), target_n=target_n)
+                chans.append(to_uint8(R))
+            img = np.stack(chans, axis=0).astype(np.float32) / 255.0
+
+            aux = np.array([w["aux"][k] for k in aux_features], dtype=np.float32)
+
+            name = f"win{i:06d}.pt"
+            torch.save({"seq": torch.from_numpy(seq),
+                       "img": torch.from_numpy(img),
+                       "aux": torch.from_numpy(aux)}, d / name)
+            rows.append((split, name, w["region"], w["start_time"], w["end_time"],
+                        w["label"], *[w["aux"][k] for k in aux_features]))
+
+    mpath = root / "manifest.csv"
+    with open(mpath, "w", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(["split", "filename", "region", "start_time", "end_time",
+                    "label", *aux_features])
+        wr.writerows(rows)
+
+    df = pd.DataFrame(rows, columns=["split", "filename", "region", "start_time", "end_time",
+                                     "label", *aux_features])
+    print(f"\n[write] {len(df)} windows -> {mpath}")
+    print(f"        seq {seq.shape}  img {img.shape}  aux ({len(aux_features)},)")
+    print("\n  Class balance per split (this is what the floors must beat):")
+    for split in split_names:
+        sub = df[df.split == split]
+        if sub.empty:
+            print(f"     {split:5s}: EMPTY")
+            continue
+        print(f"     {split:5s}: n={len(sub):5d}  positive rate {sub.label.mean():.3f}")
+    n_days = int(df.days_since_prev_major.notna().sum()) if "days_since_prev_major" in df else 0
+    print(f"  days_since_prev_major computed for {n_days}/{len(df)} windows "
+          f"(NaN where no qualifying event precedes the window; handled at load time).")
+
+
+def run_catalog_forecast_dataset(catalog_path: str, output_dir: str,
+                                 zones: Optional[Dict[str, Tuple[float, float, float, float]]] = None,
+                                 min_magnitude: float = 2.0, window_events: int = 64,
+                                 stride_events: int = 8, threshold: float = 4.5,
+                                 horizon_days: float = 30.0, target_n: int = 32,
+                                 ratios=(0.70, 0.15, 0.15)) -> None:
+    """
+    Orchestrator for the dense per-zone forecasting dataset -- the
+    `generate-catalog-forecast-dataset` CLI command. `zones` defaults to
+    `forecast.FAULT_ZONES` when not given (passed explicitly by the CLI layer
+    so this module does not need to import `forecast.py`, which itself
+    imports from here).
+    """
+    if zones is None:
+        raise ValueError("zones must be supplied (see seismic_cli.forecast.FAULT_ZONES)")
+
+    print("=" * 64)
+    print("CATALOG DENSE-TARGET DATASET (M >= threshold within horizon_days, per zone)")
+    print("=" * 64)
+    df = load_catalog(catalog_path, min_magnitude=min_magnitude)
+    windows = pool_dense_zones(df, zones, window_events, stride_events, threshold, horizon_days)
+    if not windows:
+        print("[ERROR] No usable windows.")
+        return
+
+    parts = dense_chronological_split(windows, ratios, horizon_days)
+    if not parts["train"] or not parts["test"]:
+        print("\n[ERROR] Train or test split came out empty; widen zones, lower --threshold, "
+              "or extend the catalog. Nothing was written.")
+        return
+
+    encode_and_write_dense(parts, output_dir, target_n=target_n)
+    print("\n[COMPLETE] Dense forecasting dataset ready.")
