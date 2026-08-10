@@ -162,11 +162,13 @@ _worker: Dict[str, object] = {}
 
 
 def _init_regression_worker(station_baselines, encoder, fs, window_seconds, overlap,
-                            max_gap_fraction, freqmin, freqmax, event_meta, station_coords):
+                            max_gap_fraction, freqmin, freqmax, event_meta, station_coords,
+                            per_component_aux=False):
     _worker.update(station_baselines=station_baselines, encoder=encoder, fs=fs,
                    window_seconds=window_seconds, overlap=overlap,
                    max_gap_fraction=max_gap_fraction, freqmin=freqmin, freqmax=freqmax,
-                   event_meta=event_meta, station_coords=station_coords)
+                   event_meta=event_meta, station_coords=station_coords,
+                   per_component_aux=per_component_aux)
 
 
 def _process_regression_file(args):
@@ -181,6 +183,7 @@ def _process_regression_file(args):
     freqmax = _worker["freqmax"]
     event_meta = _worker["event_meta"]
     station_coords = _worker["station_coords"]
+    per_component_aux = _worker["per_component_aux"]
     from obspy import read
     try:
         st = read(str(file_path))
@@ -244,22 +247,34 @@ def _process_regression_file(args):
                 for i in range(win.shape[1]):
                     cleaned[:, i] = clean_and_filter_1d(win[:, i], fs_station, freqmin, freqmax)
 
-                # log SNR against the station's own long-term noise level,
-                # averaged over components. This is the amplitude term the
-                # encoding may not preserve, so it is recorded regardless.
-                snrs = []
-                for i, comp in enumerate(selection):
-                    _mu, sigma_noise = station_baselines.get((sta_key, comp), (None, None))
-                    sigma_win = float(np.std(cleaned[:, i]))
-                    if sigma_noise and sigma_noise > 0 and sigma_win > 0:
-                        snrs.append(math.log(sigma_win / sigma_noise))
-                log_snr = float(np.mean(snrs)) if snrs else float("nan")
+                # log SNR against the station's own long-term noise level --
+                # the amplitude term the encoding may not preserve, so it is
+                # recorded regardless. Per-component (one scalar per Z/N/E,
+                # NaN per-slot on missing baseline/dead channel) mirrors
+                # ram_aux.RamAuxEncoderV2's math instead of collapsing to one
+                # Z/N/E-averaged value.
+                if per_component_aux:
+                    snr_per_component = [float("nan")] * len(selection)
+                    for i, comp in enumerate(selection):
+                        _mu, sigma_noise = station_baselines.get((sta_key, comp), (None, None))
+                        sigma_win = float(np.std(cleaned[:, i]))
+                        if sigma_noise and sigma_noise > 0 and sigma_win > 0:
+                            snr_per_component[i] = math.log(sigma_win / sigma_noise)
+                    aux_vals = snr_per_component
+                else:
+                    snrs = []
+                    for i, comp in enumerate(selection):
+                        _mu, sigma_noise = station_baselines.get((sta_key, comp), (None, None))
+                        sigma_win = float(np.std(cleaned[:, i]))
+                        if sigma_noise and sigma_noise > 0 and sigma_win > 0:
+                            snrs.append(math.log(sigma_win / sigma_noise))
+                    aux_vals = [float(np.mean(snrs)) if snrs else float("nan")]
 
                 stem = f"{file_path.stem}_{sta_key}_win{w_idx:03d}"
                 filename = encoder(cleaned, fs_station, sta_key, selection,
                                    station_baselines, out_dir, stem)
                 rows.append((split_name, sta_key, str(event_id), str(file_path), filename,
-                             fs_station, meta["magnitude"], log_snr, dist_km))
+                             fs_station, meta["magnitude"], *aux_vals, dist_km))
         return rows
     except Exception as e:
         return f"[WARN] Failed file {file_path.stem}: {e}"
@@ -288,6 +303,7 @@ def run_regression_preprocessing(
     max_gap_fraction: float = 0.05,
     num_cores: Optional[int] = None,
     seed: int = 42,
+    per_component_aux: bool = False,
 ):
     if split_by not in ("event", "station"):
         raise ValueError("split_by must be 'event' or 'station'")
@@ -399,7 +415,8 @@ def run_regression_preprocessing(
 
     tasks = [(fp, asg) for fp, asg in file_assignments.items()]
     init_args = (station_baselines, encoder, fs, window_seconds, overlap,
-                max_gap_fraction, freqmin, freqmax, event_meta, station_coords)
+                max_gap_fraction, freqmin, freqmax, event_meta, station_coords,
+                per_component_aux)
 
     manifest: List[tuple] = []
     with concurrent.futures.ProcessPoolExecutor(
@@ -416,16 +433,18 @@ def run_regression_preprocessing(
         print("[ERROR] No windows were written.")
         return
 
+    snr_cols = (["log_snr_0", "log_snr_1", "log_snr_2"] if per_component_aux else ["log_snr"])
+
     manifest_path = Path(output_dir) / "manifest.csv"
     with open(manifest_path, "w", newline="") as f:
         wr = csv.writer(f)
         wr.writerow(["split", "station_key", "event_id", "file_path", "filename",
-                     "fs", "magnitude", "log_snr", "distance_km"])
+                     "fs", "magnitude"] + snr_cols + ["distance_km"])
         wr.writerows(manifest)
 
     # ---- report label coverage and residual leakage ------------------------
     df = pd.DataFrame(manifest, columns=["split", "station_key", "event_id", "file_path",
-                                         "filename", "fs", "magnitude", "log_snr", "distance_km"])
+                                         "filename", "fs", "magnitude"] + snr_cols + ["distance_km"])
     print(f"\n[PHASE 4] Wrote {len(df)} labelled windows to {manifest_path}")
     print("\n  Magnitude coverage per split:")
     for s in splits:
@@ -455,5 +474,6 @@ def run_regression_preprocessing(
     n_dist = int(df.distance_km.notna().sum())
     print(f"\n  distance_km present for {n_dist}/{len(df)} rows"
           + ("" if n_dist else "  (pass --station-catalog to enable it)"))
-    print(f"  log_snr present for {int(df.log_snr.notna().sum())}/{len(df)} rows")
+    for col in snr_cols:
+        print(f"  {col} present for {int(df[col].notna().sum())}/{len(df)} rows")
     print("\n[COMPLETE] Regression dataset ready.")

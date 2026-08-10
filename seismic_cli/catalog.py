@@ -856,7 +856,10 @@ def build_dense_windows(df: pd.DataFrame, region_label: str,
     depth = rdf.depth.to_numpy(dtype=np.float64)
     energy = energy_joules(mag)
 
-    major_times = t[mag >= threshold]           # NOT declustered -- see docstring
+    is_major = mag >= threshold
+    major_times = t[is_major]                   # NOT declustered -- see docstring
+    major_mag = mag[is_major]                    # same mask, so major_times[i]/major_mag[i]
+                                                  # always refer to the same event
     if len(major_times) == 0:
         print(f"[SKIP] {region_label}: no M >= {threshold} events in this region.")
         return []
@@ -916,7 +919,9 @@ def build_dense_windows(df: pd.DataFrame, region_label: str,
             "days_since_prev_major": days_since,
         }
 
-        fut = major_times[(major_times > end_time) & (major_times <= end_time + horizon)]
+        fut_mask = (major_times > end_time) & (major_times <= end_time + horizon)
+        fut = major_times[fut_mask]
+        fut_mag = major_mag[fut_mask]
         out.append({
             "start_idx": start,
             "start_time": pd.Timestamp(wt[0]),
@@ -925,6 +930,10 @@ def build_dense_windows(df: pd.DataFrame, region_label: str,
             "seq": seq,
             "aux": aux,
             "label": int(len(fut) > 0),
+            # Magnitude of the FIRST (earliest) qualifying event within the
+            # horizon -- literally "the next one." NaN exactly when
+            # label == 0, since there's nothing to predict the magnitude of.
+            "next_magnitude": float(fut_mag[0]) if len(fut_mag) else float("nan"),
         })
 
     pos = np.mean([w["label"] for w in out]) if out else float("nan")
@@ -1022,17 +1031,18 @@ def encode_and_write_dense(parts: Dict[str, List[dict]], output_dir: str, target
                        "img": torch.from_numpy(img),
                        "aux": torch.from_numpy(aux)}, d / name)
             rows.append((split, name, w["region"], w["start_time"], w["end_time"],
-                        w["label"], *[w["aux"][k] for k in aux_features]))
+                        w["label"], w.get("next_magnitude", float("nan")),
+                        *[w["aux"][k] for k in aux_features]))
 
     mpath = root / "manifest.csv"
     with open(mpath, "w", newline="") as f:
         wr = csv.writer(f)
         wr.writerow(["split", "filename", "region", "start_time", "end_time",
-                    "label", *aux_features])
+                    "label", "next_magnitude", *aux_features])
         wr.writerows(rows)
 
     df = pd.DataFrame(rows, columns=["split", "filename", "region", "start_time", "end_time",
-                                     "label", *aux_features])
+                                     "label", "next_magnitude", *aux_features])
     print(f"\n[write] {len(df)} windows -> {mpath}")
     print(f"        seq {seq.shape}  img {img.shape}  aux ({len(aux_features)},)")
     print("\n  Class balance per split (this is what the floors must beat):")
@@ -1045,6 +1055,11 @@ def encode_and_write_dense(parts: Dict[str, List[dict]], output_dir: str, target
     n_days = int(df.days_since_prev_major.notna().sum()) if "days_since_prev_major" in df else 0
     print(f"  days_since_prev_major computed for {n_days}/{len(df)} windows "
           f"(NaN where no qualifying event precedes the window; handled at load time).")
+    n_pos = int(df.label.sum())
+    n_mag = int(df.next_magnitude.notna().sum())
+    match = "OK" if n_mag == n_pos else "MISMATCH -- pairing bug in build_dense_windows"
+    print(f"  next_magnitude defined for {n_mag}/{len(df)} windows, "
+          f"vs. {n_pos} positive-label windows -- {match}")
 
 
 def run_catalog_forecast_dataset(catalog_path: str, output_dir: str,

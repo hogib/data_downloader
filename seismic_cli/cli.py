@@ -556,6 +556,10 @@ def generate_regression_dataset_cmd(
         "event", help="event = keep whole events together (default; the magnitude label is per-event, "
                       "so a shared event leaks the target directly). station = station-disjoint instead."),
     n_fft: int = typer.Option(256, help="FFT size (spectrogram encoding)."),
+    hop_length: Optional[int] = typer.Option(
+        None, help="STFT hop (spectrogram encoding). Default n_fft//4 (=64, giving only ~5 time "
+                    "frames from a 3s window); pass a smaller value (e.g. 16) for finer time "
+                    "resolution at the same frequency resolution."),
     top_db: float = typer.Option(80.0, help="Dynamic-range clamp (spectrogram encoding)."),
     normalize: str = typer.Option("station", help="Spectrogram normalization; see generate-spectrogram-dataset."),
     target_n: int = typer.Option(64, help="RAM image resolution (ram encoding)."),
@@ -567,6 +571,11 @@ def generate_regression_dataset_cmd(
     freqmax: float = typer.Option(45.0, help="Bandpass high corner (Hz)."),
     fs: float = typer.Option(100.0, help="Nominal sampling rate."),
     seed: int = typer.Option(42),
+    per_component_aux: bool = typer.Option(
+        False, "--per-component-aux",
+        help="Emit 3 per-component log_snr scalars (log_snr_0/1/2, one per Z/N/E) instead of "
+             "one Z/N/E-averaged log_snr. Off by default so existing datasets reproduce "
+             "byte-for-byte when regenerated."),
     num_cores: Optional[int] = typer.Option(None),
 ):
     """
@@ -588,11 +597,11 @@ def generate_regression_dataset_cmd(
         profiles = {}
         if normalize == "station":
             profiles = spectrogram.compute_station_spectral_baselines(
-                noise_dir, n_fft=n_fft, top_db=top_db, nominal_fs=fs,
+                noise_dir, n_fft=n_fft, hop_length=hop_length, top_db=top_db, nominal_fs=fs,
                 freqmin=freqmin, freqmax=freqmax,
             )
         spec_encoder = spectrogram.SpectrogramEncoder(
-            n_fft=n_fft, top_db=top_db, nominal_fs=fs, window_seconds=window_seconds,
+            n_fft=n_fft, hop_length=hop_length, top_db=top_db, nominal_fs=fs, window_seconds=window_seconds,
             normalize=normalize, noise_profiles=profiles,
         )
         encoder = spectrogram.SpectrogramDualEncoder(spec_encoder) if dual else spec_encoder
@@ -609,6 +618,7 @@ def generate_regression_dataset_cmd(
         window_seconds=window_seconds, overlap=overlap,
         max_windows_per_station=max_windows_per_station, split_by=split_by,
         freqmin=freqmin, freqmax=freqmax, num_cores=num_cores, seed=seed,
+        per_component_aux=per_component_aux,
     )
 
 
