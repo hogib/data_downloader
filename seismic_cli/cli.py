@@ -19,7 +19,7 @@ Usage examples:
       --window-seconds 60 --overlap 0.25
 """
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import typer
 
@@ -279,6 +279,19 @@ def generate_spec_dual_dataset_cmd(
                                           "smaller --batch-size when training."),
     min_baseline_seconds: float = typer.Option(60.0, help="Minimum seconds of usable noise data "
                                                             "required before trusting a station's baseline."),
+    hard_negatives: bool = typer.Option(
+        False, "--hard-negatives/--no-hard-negatives",
+        help="Choose noise windows by AMPLITUDE rather than evenly across each file. "
+             "Random noise makes the task nearly solvable by loudness alone (measured: "
+             "one amplitude scalar scores 0.95 AUC); drawing the surviving noise from "
+             "the loud band drops that to ~0.86, and to ~0.78 at the top decile, which "
+             "forces a model onto waveform character. Only affects which noise windows "
+             "are kept -- the pool, the events and the splits are unchanged."),
+    hard_negative_band: Tuple[float, float] = typer.Option(
+        (0.75, 0.99), help="Percentile band of the amplitude ranking to mine, as LOW HIGH. "
+                           "The upper bound matters: the loudest tail of screened noise is "
+                           "where a catalog-missed earthquake hides, so mining it would put "
+                           "positives into the negative class."),
     num_cores: Optional[int] = typer.Option(None, help="Worker processes (default: cpu_count - 1)."),
 ):
     """
@@ -319,6 +332,7 @@ def generate_spec_dual_dataset_cmd(
         use_baseline_standardization=baseline, freqmin=freqmin, freqmax=freqmax,
         min_baseline_seconds=min_baseline_seconds, num_cores=num_cores,
         generate_max=generate_max, encoder=encoder,
+        hard_negatives=hard_negatives, hard_negative_band=tuple(hard_negative_band),
     )
 
 

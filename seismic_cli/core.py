@@ -421,6 +421,72 @@ class RamImageEncoder:
         return filename
 
 
+def _window_amplitude_scores(windows, selection, sta_key, station_baselines):
+    """
+    One amplitude score per window: the loudest component, expressed in units
+    of that (station, component)'s long-term noise sigma when a baseline
+    exists, and in raw counts otherwise.
+
+    Deliberately computed on the RAW window -- no detrend, no bandpass. A
+    standard deviation is already immune to the DC offset, and scoring is only
+    ever used to RANK windows within one (file, station) group, where every
+    candidate shares an instrument and a passband. Filtering all ~99 windows of
+    a 300 s noise file just to rank them would cost ~50x the filtfilt work of
+    the handful actually kept.
+    """
+    scores = np.empty(len(windows), dtype=np.float64)
+    for j, (_w_idx, win) in enumerate(windows):
+        best = 0.0
+        for i, comp in enumerate(selection):
+            v = float(np.std(win[:, i]))
+            base = station_baselines.get((sta_key, comp))
+            if base is not None and base[1] > 0:
+                v /= base[1]
+            if v > best:
+                best = v
+        scores[j] = best
+    return scores
+
+
+def _select_hard_negatives(windows, scores, quota, band):
+    """
+    Picks `quota` windows from the `band` percentile slice of `scores`, spread
+    evenly ACROSS that slice rather than taken from its top.
+
+    Why a band and not simply the loudest: the noisiest tail of a screened
+    noise archive is where an earthquake missed by the catalog is most likely
+    to be hiding, and mining that tail would inject positives into the negative
+    class. The upper bound holds the selection below it. Spreading across the
+    band keeps a range of difficulty instead of collapsing onto one amplitude.
+
+    Falls back to widening the band (and finally to even spacing over all
+    windows) whenever the band cannot supply the quota, so a file is never
+    silently under-filled.
+    """
+    n = len(windows)
+    if quota >= n:
+        return windows
+    lo_q, hi_q = band
+    order = np.argsort(scores, kind="stable")
+    lo_i, hi_i = int(round(lo_q * n)), int(round(hi_q * n))
+    lo_i = max(0, min(lo_i, n - 1))
+    hi_i = max(lo_i + 1, min(hi_i, n))
+
+    if hi_i - lo_i < quota:
+        # Widen downward first (quieter, still harder than random), then upward.
+        lo_i = max(0, hi_i - quota)
+        if hi_i - lo_i < quota:
+            hi_i = min(n, lo_i + quota)
+
+    candidates = order[lo_i:hi_i]
+    if len(candidates) <= quota:
+        chosen = candidates
+    else:
+        pick = np.linspace(0, len(candidates) - 1, quota).round().astype(int)
+        chosen = candidates[np.unique(pick)]
+    return [windows[i] for i in sorted(chosen.tolist())]
+
+
 def mseed_file_to_dataset(
     file_path: Path,
     station_assignments: Dict[str, Tuple[str, str, Path, Optional[int]]],
@@ -432,6 +498,8 @@ def mseed_file_to_dataset(
     max_gap_fraction: float = 0.05,
     freqmin: float = 1.0,
     freqmax: float = 45.0,
+    hard_negative_class: Optional[str] = None,
+    hard_negative_band: Tuple[float, float] = (0.75, 0.99),
 ) -> List[Tuple[str, str, str, str, str, float]]:
     """
     Reads one mseed file ONCE and writes output only for the stations present
@@ -501,8 +569,14 @@ def mseed_file_to_dataset(
         split_name, class_name, out_dir, window_quota = station_assignments[sta_key]
 
         if window_quota is not None and len(windows) > window_quota:
-            sel_idx = np.linspace(0, len(windows) - 1, window_quota).round().astype(int)
-            windows = [windows[i] for i in sorted(set(sel_idx.tolist()))]
+            if hard_negative_class is not None and class_name == hard_negative_class:
+                scores = _window_amplitude_scores(windows, selection, sta_key,
+                                                  station_baselines)
+                windows = _select_hard_negatives(windows, scores, window_quota,
+                                                 hard_negative_band)
+            else:
+                sel_idx = np.linspace(0, len(windows) - 1, window_quota).round().astype(int)
+                windows = [windows[i] for i in sorted(set(sel_idx.tolist()))]
 
         for w_idx, win in windows:
             cleaned_win = np.zeros_like(win, dtype=np.float64)
@@ -528,12 +602,15 @@ def mseed_file_to_ram_rgb(file_path, station_assignments, station_baselines,
 
 def _process_task(args):
     (file_path, station_assignments, station_baselines, encoder, fs,
-     window_seconds, overlap, max_gap_fraction, freqmin, freqmax) = args
+     window_seconds, overlap, max_gap_fraction, freqmin, freqmax,
+     hard_negative_class, hard_negative_band) = args
     try:
         return mseed_file_to_dataset(
             file_path, station_assignments, station_baselines, encoder, fs,
             window_seconds, overlap, max_gap_fraction=max_gap_fraction,
             freqmin=freqmin, freqmax=freqmax,
+            hard_negative_class=hard_negative_class,
+            hard_negative_band=hard_negative_band,
         )
     except Exception as e:
         return f"[WARN] Failed file {file_path.stem}: {e}"
@@ -605,6 +682,8 @@ def run_balanced_preprocessing(
     max_gap_fraction: float = 0.05,
     generate_max: bool = False,
     encoder=None,
+    hard_negatives: bool = False,
+    hard_negative_band: Tuple[float, float] = (0.75, 0.99),
 ):
     if encoder is None:
         encoder = RamImageEncoder(target_n)
@@ -616,8 +695,22 @@ def run_balanced_preprocessing(
     mode_label = "baseline-standardized" if use_baseline_standardization else "plain per-window standardization"
     if generate_max:
         mode_label += ", MAX mode"
+    if hard_negatives:
+        mode_label += ", HARD NEGATIVES"
     print(f"STARTING DATASET GENERATION (station-disjoint splits, {mode_label})")
     print("=" * 60)
+    hard_negative_class = "00_noise" if hard_negatives else None
+    if hard_negatives:
+        lo, hi = hard_negative_band
+        print(f"[INFO] Hard-negative mining ON: noise windows are ranked by amplitude "
+              f"relative to their station's noise floor, and the kept ones are drawn "
+              f"from the {lo:.0%}-{hi:.0%} band rather than sampled evenly.")
+        print(f"       The upper bound is deliberate -- the loudest tail of a screened "
+              f"noise archive is where a catalog-missed earthquake would hide, and "
+              f"mining it would put positives into the negative class.")
+        print(f"[WARN] This makes the dataset intentionally UNREPRESENTATIVE of "
+              f"deployment noise. Use it for training; keep a randomly-sampled test "
+              f"set for any calibrated/absolute number.")
     if max_windows_per_station is not None:
         print(f"[INFO] Capping any single station's contribution to at most "
               f"{max_windows_per_station} windows across all its event files "
@@ -877,7 +970,8 @@ def run_balanced_preprocessing(
 
     tasks = [
         (fpath, assignments, station_baselines, encoder, fs, window_seconds,
-         overlap, max_gap_fraction, freqmin, freqmax)
+         overlap, max_gap_fraction, freqmin, freqmax,
+         hard_negative_class, hard_negative_band)
         for fpath, assignments in file_to_assignments.items()
     ]
 
