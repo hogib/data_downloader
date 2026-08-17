@@ -49,6 +49,93 @@ from seismic_cli.core import clean_and_filter_1d, select_components
 
 NORMALIZE_MODES = ("station", "per_window", "none")
 
+# An STFT frame spanning more than this fraction of the analysis window has too
+# little of the window left to resolve anything in time. 0.25 keeps at least
+# four independent frame positions; 0.50 and above is effectively a single
+# smeared frame and is flagged harder.
+NFFT_WINDOW_FRACTION_WARN = 0.25
+NFFT_WINDOW_FRACTION_SEVERE = 0.50
+MIN_USEFUL_FRAMES = 8
+# Below this, frequency resolution (fs / n_fft) gets too coarse to separate the
+# 1-45 Hz band regardless of how many frames it buys.
+MIN_SUGGESTED_NFFT = 32
+
+
+def stft_geometry(window_seconds: float, nominal_fs: float, n_fft: int,
+                  hop_length: Optional[int] = None) -> Dict[str, float]:
+    """
+    Resolves what an (n_fft, hop) choice actually produces for a given window.
+
+    `frames` matches torchaudio's `Spectrogram` with its default `center=True`
+    (`n_samples // hop + 1`), verified against emitted tensors at both 3 s and
+    6 s rather than assumed.
+    """
+    hop_length = hop_length if hop_length is not None else n_fft // 4
+    n_samples = int(round(nominal_fs * window_seconds))
+    return {
+        "n_samples": n_samples,
+        "hop_length": hop_length,
+        "freq_bins": n_fft // 2 + 1,
+        "frames": (n_samples // hop_length) + 1 if hop_length > 0 else 0,
+        "nfft_seconds": n_fft / nominal_fs,
+        "window_fraction": (n_fft / n_samples) if n_samples else float("inf"),
+        "freq_resolution_hz": nominal_fs / n_fft,
+    }
+
+
+def suggest_stft_params(window_seconds: float, nominal_fs: float) -> Tuple[int, int]:
+    """
+    Largest power-of-two `n_fft` spanning at most a quarter of the window, with
+    `hop = n_fft // 4`.
+
+    Tying n_fft to the window rather than fixing it means time resolution stays
+    constant as the window changes: this yields 19 frames at both 3 s and 6 s,
+    where a fixed n_fft=256 gives 10 frames at 6 s and only 5 at 3 s.
+    """
+    n_samples = int(round(nominal_fs * window_seconds))
+    budget = max(MIN_SUGGESTED_NFFT, int(n_samples * NFFT_WINDOW_FRACTION_WARN))
+    n_fft = 1 << max(int(budget).bit_length() - 1, 5)   # floor to a power of two, >= 32
+    return n_fft, max(1, n_fft // 4)
+
+
+def check_stft_resolution(window_seconds: float, nominal_fs: float, n_fft: int,
+                          hop_length: Optional[int] = None) -> Optional[str]:
+    """
+    Returns a warning string when (n_fft, hop) is badly matched to the window,
+    else None.
+
+    This exists because a 3 s dataset was generated with the 6 s default of
+    n_fft=256: one frame then spans 85% of the window and the tensor collapses
+    to 5 time bins, which is a silently degraded input rather than an error.
+    Nothing in the pipeline noticed.
+    """
+    g = stft_geometry(window_seconds, nominal_fs, n_fft, hop_length)
+    sug_nfft, sug_hop = suggest_stft_params(window_seconds, nominal_fs)
+    if g["window_fraction"] <= NFFT_WINDOW_FRACTION_WARN and g["frames"] >= MIN_USEFUL_FRAMES:
+        return None
+    if n_fft <= sug_nfft:
+        # Already at or below what this window can support. On very short
+        # windows `MIN_SUGGESTED_NFFT` binds and the recommendation itself
+        # exceeds the fraction budget; warning here would demand a value the
+        # function cannot recommend, so say nothing rather than something
+        # unactionable.
+        return None
+    severity = "SEVERE" if g["window_fraction"] > NFFT_WINDOW_FRACTION_SEVERE else "WARN"
+    sug = stft_geometry(window_seconds, nominal_fs, sug_nfft, sug_hop)
+    return (
+        f"[{severity}] n_fft={n_fft} is poorly matched to a {window_seconds:g}s window "
+        f"at {nominal_fs:g} Hz.\n"
+        f"        One frame spans {g['nfft_seconds']:.2f}s = {g['window_fraction'] * 100:.0f}% "
+        f"of the window, leaving only {int(g['frames'])} time bins "
+        f"(tensor {g['freq_bins']} x {int(g['frames'])}).\n"
+        f"        Suggested: --n-fft {sug_nfft} --hop-length {sug_hop}  -> "
+        f"{sug['freq_bins']} x {int(sug['frames'])} bins, "
+        f"{sug['freq_resolution_hz']:.2f} Hz resolution, "
+        f"{sug['window_fraction'] * 100:.0f}% of the window per frame.\n"
+        f"        Keeping the current value is fine ONLY if you are matching an "
+        f"existing dataset -- a model must see the same geometry it was trained on."
+    )
+
 
 def _resample_to(x: np.ndarray, fs_from: float, fs_to: float) -> np.ndarray:
     """Polyphase resample so every window yields the same number of samples."""
@@ -99,6 +186,12 @@ class SpectrogramEncoder:
         self.normalize = normalize
         self.noise_profiles = noise_profiles or {}
         self._tf = None  # lazily built per worker process
+
+        # Fires once, where the encoder is constructed -- workers receive it
+        # unpickled, so this does not repeat per process.
+        problem = check_stft_resolution(window_seconds, nominal_fs, n_fft, hop_length)
+        if problem:
+            print(problem)
 
     # -- lazy torch setup -------------------------------------------------
     def _transforms(self):

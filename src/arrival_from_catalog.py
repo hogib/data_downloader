@@ -40,6 +40,7 @@ be audited instead of inferred.
 Requires: obspy, numpy, pandas
 """
 
+import argparse
 import csv
 import multiprocessing
 import re
@@ -59,11 +60,17 @@ OUTPUT_BASE_DIR = BASE_DIR / "raw/data/batched_waveforms"
 CATALOG_FILE = BASE_DIR / "catalogs/extracted_earthquakes.csv"
 STATION_COORDS_FILE = BASE_DIR / "catalogs/station_coords.csv"
 
+# Overridden by --window-seconds / --pre-arrival-seconds.
 TARGET_WINDOWS = [("window_post_6s_catalog", 6.0)]
 
 # Seconds of pre-arrival buffer inside each window. The predicted arrival has a
 # ~0.6 s MAD against independent picks; 2.0 s keeps the onset inside the window
 # even on the early tail, and leaves 4.0 s of post-arrival signal at 6 s.
+#
+# Shortening the window shortens this buffer, and the prediction spread does NOT
+# shrink with it. At 3 s with a 1.0 s buffer the onset sits only ~1.6 MAD inside
+# the window, so a prediction running early can push it out -- the retention
+# figure printed at the end is the check on that, not an assumption.
 PRE_ARRIVAL_SECONDS = 2.0
 
 TAUP_MODEL = "iasp91"
@@ -242,7 +249,23 @@ def process_one_file(args):
 
 
 def main():
-    limit = int(sys.argv[1]) if len(sys.argv) > 1 else None
+    global TARGET_WINDOWS, PRE_ARRIVAL_SECONDS
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--window-seconds", type=float, default=6.0)
+    ap.add_argument("--pre-arrival-seconds", type=float, default=None,
+                    help="Default: one third of --window-seconds, matching the "
+                         "6 s / 2.0 s geometry.")
+    ap.add_argument("--out-name", default=None,
+                    help="Output subdirectory. Default window_post_<N>s_catalog.")
+    ap.add_argument("--limit", type=int, default=None, help="Process only N files.")
+    a = ap.parse_args()
+
+    ws = a.window_seconds
+    PRE_ARRIVAL_SECONDS = a.pre_arrival_seconds if a.pre_arrival_seconds is not None else ws / 3.0
+    name = a.out_name or f"window_post_{int(ws) if ws == int(ws) else ws}s_catalog"
+    TARGET_WINDOWS = [(name, ws)]
+    limit = a.limit
 
     print("=" * 64)
     print("CATALOG-ANCHORED WINDOW GENERATION (TauP predicted P, no trigger gate)")

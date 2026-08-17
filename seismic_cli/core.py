@@ -428,11 +428,13 @@ def _window_amplitude_scores(windows, selection, sta_key, station_baselines):
     exists, and in raw counts otherwise.
 
     Deliberately computed on the RAW window -- no detrend, no bandpass. A
-    standard deviation is already immune to the DC offset, and scoring is only
-    ever used to RANK windows within one (file, station) group, where every
-    candidate shares an instrument and a passband. Filtering all ~99 windows of
-    a 300 s noise file just to rank them would cost ~50x the filtfilt work of
-    the handful actually kept.
+    standard deviation is already immune to the DC offset, and dividing by the
+    station's own noise sigma puts every station on one comparable scale, which
+    is what lets scores be ranked ACROSS stations in the global pass.
+
+    Normalizing by the baseline is what makes global ranking meaningful. Ranked
+    on raw counts, "loudest" would just mean "highest-gain instrument", and the
+    mined negatives would all come from a handful of stations.
     """
     scores = np.empty(len(windows), dtype=np.float64)
     for j, (_w_idx, win) in enumerate(windows):
@@ -448,43 +450,105 @@ def _window_amplitude_scores(windows, selection, sta_key, station_baselines):
     return scores
 
 
-def _select_hard_negatives(windows, scores, quota, band):
+def _pick_from_band(scores, quota, band):
     """
-    Picks `quota` windows from the `band` percentile slice of `scores`, spread
-    evenly ACROSS that slice rather than taken from its top.
+    Indices of `quota` items drawn from the `band` percentile slice of `scores`,
+    spread evenly ACROSS the slice rather than taken from its top.
 
-    Why a band and not simply the loudest: the noisiest tail of a screened
-    noise archive is where an earthquake missed by the catalog is most likely
-    to be hiding, and mining that tail would inject positives into the negative
-    class. The upper bound holds the selection below it. Spreading across the
-    band keeps a range of difficulty instead of collapsing onto one amplitude.
+    Why a band and not simply the loudest: the noisiest tail of a screened noise
+    archive is where an earthquake missed by the catalog is most likely to be
+    hiding, and mining that tail would inject positives into the negative class.
+    The upper bound holds selection below it. Spreading across the band keeps a
+    range of difficulty instead of collapsing onto one amplitude.
 
-    Falls back to widening the band (and finally to even spacing over all
-    windows) whenever the band cannot supply the quota, so a file is never
-    silently under-filled.
+    Widens the band (downward first -- quieter, still harder than random) rather
+    than under-filling the quota.
     """
-    n = len(windows)
+    n = len(scores)
     if quota >= n:
-        return windows
+        return np.arange(n)
     lo_q, hi_q = band
     order = np.argsort(scores, kind="stable")
     lo_i, hi_i = int(round(lo_q * n)), int(round(hi_q * n))
     lo_i = max(0, min(lo_i, n - 1))
     hi_i = max(lo_i + 1, min(hi_i, n))
-
     if hi_i - lo_i < quota:
-        # Widen downward first (quieter, still harder than random), then upward.
         lo_i = max(0, hi_i - quota)
         if hi_i - lo_i < quota:
             hi_i = min(n, lo_i + quota)
-
     candidates = order[lo_i:hi_i]
     if len(candidates) <= quota:
-        chosen = candidates
-    else:
-        pick = np.linspace(0, len(candidates) - 1, quota).round().astype(int)
-        chosen = candidates[np.unique(pick)]
-    return [windows[i] for i in sorted(chosen.tolist())]
+        return candidates
+    pick = np.linspace(0, len(candidates) - 1, quota).round().astype(int)
+    return candidates[np.unique(pick)]
+
+
+def _score_windows_task(args):
+    """
+    Scoring pre-pass worker: windows one file exactly as the generation worker
+    will, but only measures amplitude -- no cleaning, no encoding, nothing
+    written.
+
+    Returns [(sta_key, w_idx, score)] for the stations assigned to the mined
+    class. Window indices come from the same `window_array_indexed` call the
+    generation pass uses, so an index selected here lands on the same samples
+    there.
+    """
+    (file_path, station_assignments, station_baselines, fs, window_seconds,
+     overlap, max_gap_fraction, target_class) = args
+    try:
+        st = read(str(file_path))
+        try:
+            st.merge(method=1)
+        except Exception:
+            return file_path, []
+
+        stations: Dict[str, Dict[str, Tuple[np.ndarray, np.ndarray, float]]] = {}
+        for tr in st:
+            sta_key = f"{tr.stats.network}.{tr.stats.station}"
+            if sta_key not in station_assignments:
+                continue
+            if station_assignments[sta_key][1] != target_class:
+                continue
+            chan = tr.stats.channel[-1].upper()
+            existing = stations.setdefault(sta_key, {}).get(chan)
+            if existing is not None and len(existing[0]) >= tr.stats.npts:
+                continue
+            data, gap_mask = _masked_to_filled(tr.data)
+            stations[sta_key][chan] = (data, gap_mask, tr.stats.sampling_rate)
+
+        out = []
+        for sta_key, channels in stations.items():
+            selection = select_components(channels.keys())
+            if selection is None:
+                continue
+            rates = {channels[c][2] for c in selection}
+            if len(rates) != 1:
+                continue
+            fs_station = rates.pop()
+            target_samples = int(fs_station * window_seconds)
+            tolerance = int(target_samples * 0.05)
+            raw_channels = [channels[c][0] for c in selection]
+            raw_masks = [channels[c][1] for c in selection]
+            min_len = min(len(ch) for ch in raw_channels)
+            if min_len < (target_samples - tolerance):
+                continue
+            event_data = np.column_stack([ch[:min_len] for ch in raw_channels])
+            gap_mask = np.column_stack([m[:min_len] for m in raw_masks])
+            windows, _ = window_array_indexed(
+                event_data, gap_mask, fs=fs_station,
+                window_seconds=window_seconds, overlap=overlap,
+                max_gap_fraction=max_gap_fraction,
+            )
+            if not windows:
+                continue
+            scores = _window_amplitude_scores(windows, selection, sta_key,
+                                              station_baselines)
+            for (w_idx, _win), sc in zip(windows, scores):
+                out.append((sta_key, int(w_idx), float(sc)))
+        return file_path, out
+    except Exception:
+        return file_path, []
 
 
 def mseed_file_to_dataset(
@@ -498,8 +562,6 @@ def mseed_file_to_dataset(
     max_gap_fraction: float = 0.05,
     freqmin: float = 1.0,
     freqmax: float = 45.0,
-    hard_negative_class: Optional[str] = None,
-    hard_negative_band: Tuple[float, float] = (0.75, 0.99),
 ) -> List[Tuple[str, str, str, str, str, float]]:
     """
     Reads one mseed file ONCE and writes output only for the stations present
@@ -568,15 +630,15 @@ def mseed_file_to_dataset(
 
         split_name, class_name, out_dir, window_quota = station_assignments[sta_key]
 
-        if window_quota is not None and len(windows) > window_quota:
-            if hard_negative_class is not None and class_name == hard_negative_class:
-                scores = _window_amplitude_scores(windows, selection, sta_key,
-                                                  station_baselines)
-                windows = _select_hard_negatives(windows, scores, window_quota,
-                                                 hard_negative_band)
-            else:
-                sel_idx = np.linspace(0, len(windows) - 1, window_quota).round().astype(int)
-                windows = [windows[i] for i in sorted(set(sel_idx.tolist()))]
+        if isinstance(window_quota, (set, frozenset)):
+            # Hard-negative mining: the global pre-pass already decided exactly
+            # which window indices survive, so honour that list verbatim. Any
+            # local re-selection here would undo the cross-station ranking that
+            # is the whole point of doing it globally.
+            windows = [(w_idx, win) for w_idx, win in windows if w_idx in window_quota]
+        elif window_quota is not None and len(windows) > window_quota:
+            sel_idx = np.linspace(0, len(windows) - 1, window_quota).round().astype(int)
+            windows = [windows[i] for i in sorted(set(sel_idx.tolist()))]
 
         for w_idx, win in windows:
             cleaned_win = np.zeros_like(win, dtype=np.float64)
@@ -602,15 +664,12 @@ def mseed_file_to_ram_rgb(file_path, station_assignments, station_baselines,
 
 def _process_task(args):
     (file_path, station_assignments, station_baselines, encoder, fs,
-     window_seconds, overlap, max_gap_fraction, freqmin, freqmax,
-     hard_negative_class, hard_negative_band) = args
+     window_seconds, overlap, max_gap_fraction, freqmin, freqmax) = args
     try:
         return mseed_file_to_dataset(
             file_path, station_assignments, station_baselines, encoder, fs,
             window_seconds, overlap, max_gap_fraction=max_gap_fraction,
             freqmin=freqmin, freqmax=freqmax,
-            hard_negative_class=hard_negative_class,
-            hard_negative_band=hard_negative_band,
         )
     except Exception as e:
         return f"[WARN] Failed file {file_path.stem}: {e}"
@@ -661,6 +720,91 @@ def _write_split_manifest(manifest_path: Path, entries: List[Tuple[str, str, str
         writer = csv.writer(f)
         writer.writerow(['split', 'class_name', 'station_key', 'file_path', 'filename', 'fs'])
         writer.writerows(entries)
+
+
+def _mine_hard_negatives_globally(file_to_assignments, station_baselines, fs,
+                                  window_seconds, overlap, max_gap_fraction,
+                                  target_class, band, num_cores, splits):
+    """
+    Replaces the mined class's per-file window QUOTAS with explicit per-file
+    window WHITELISTS chosen by ranking every candidate window in a split
+    against every other, across all stations.
+
+    Why global and not per-file: a first version ranked windows inside each
+    (file, station) group, which barely moved the benchmark -- the amplitude
+    floor fell only 0.9535 -> 0.9312 where a global simulation had predicted
+    ~0.86. The reason is that all ~99 windows of one 300 s noise file share a
+    station and an hour, so they are nearly equally loud; almost all of the
+    amplitude variance lives BETWEEN stations and times. Ranking per file can
+    only exploit the small part. Scores are in units of each station's own
+    noise sigma, so they are directly comparable across stations.
+
+    Costs one extra read of the mined class's files. Splits are handled
+    independently, so a train-set window can never displace a test-set one.
+    """
+    print(f"\n[HARD NEGATIVES] Scoring every candidate '{target_class}' window "
+          f"for global ranking...")
+
+    score_tasks, quota_by_key = [], {}
+    for fpath, assignments in file_to_assignments.items():
+        mined = {s: a for s, a in assignments.items() if a[1] == target_class}
+        if not mined:
+            continue
+        score_tasks.append((fpath, assignments, station_baselines, fs,
+                            window_seconds, overlap, max_gap_fraction, target_class))
+        for sta_key, (split_name, _cls, _out, quota) in mined.items():
+            quota_by_key[(fpath, sta_key)] = (split_name, quota)
+
+    print(f"  -> {len(score_tasks)} files to score on {num_cores} cores.")
+    candidates = {s: [] for s in splits}      # split -> [(fpath, sta, w_idx, score)]
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores) as executor:
+        for i, (fpath, rows) in enumerate(executor.map(_score_windows_task, score_tasks), 1):
+            if i % 2000 == 0:
+                print(f"  ...{i}/{len(score_tasks)} files scored")
+            for sta_key, w_idx, score in rows:
+                entry = quota_by_key.get((fpath, sta_key))
+                if entry is None:
+                    continue
+                candidates[entry[0]].append((fpath, sta_key, w_idx, score))
+
+    whitelist: Dict[Tuple[Path, str], set] = {}
+    for split_name in splits:
+        cands = candidates[split_name]
+        if not cands:
+            continue
+        # Reproduce the split's planned count: the sum of the quotas the
+        # balancing stage assigned, so class balance is preserved exactly.
+        target = sum(q for (f, s), (sp, q) in quota_by_key.items()
+                     if sp == split_name and q is not None)
+        if target <= 0:
+            continue
+        scores = np.array([c[3] for c in cands], dtype=np.float64)
+        chosen = _pick_from_band(scores, target, band)
+        for idx in chosen:
+            fpath, sta_key, w_idx, _sc = cands[idx]
+            whitelist.setdefault((fpath, sta_key), set()).add(w_idx)
+        sel = scores[chosen]
+        print(f"  -> {split_name}: {len(chosen)} of {len(cands)} candidate windows "
+              f"(target {target}) | score median {np.median(sel):.2f} "
+              f"vs pool median {np.median(scores):.2f} "
+              f"({np.median(sel) / max(np.median(scores), 1e-9):.2f}x louder)")
+
+    rebuilt = {}
+    for fpath, assignments in file_to_assignments.items():
+        new_assign = {}
+        for sta_key, (split_name, cls, out_dir, quota) in assignments.items():
+            if cls == target_class:
+                keep = whitelist.get((fpath, sta_key))
+                # An empty whitelist is meaningful: the global ranking placed
+                # none of this file's windows in the band. Pass the empty set
+                # so the worker writes nothing, rather than falling back to a
+                # quota and quietly re-adding random windows.
+                new_assign[sta_key] = (split_name, cls, out_dir,
+                                       frozenset(keep or ()))
+            else:
+                new_assign[sta_key] = (split_name, cls, out_dir, quota)
+        rebuilt[fpath] = new_assign
+    return rebuilt
 
 
 def run_balanced_preprocessing(
@@ -968,10 +1112,16 @@ def run_balanced_preprocessing(
             print(f"     Stations used  | Train: {ns['train']:<6} | Val: {ns['val']:<6} | Test: {ns['test']:<6}")
     print("     [INFO] Every station occupies exactly one split across BOTH classes.")
 
+    if hard_negative_class is not None:
+        file_to_assignments = _mine_hard_negatives_globally(
+            file_to_assignments, station_baselines, fs, window_seconds, overlap,
+            max_gap_fraction, hard_negative_class, hard_negative_band,
+            num_cores, splits,
+        )
+
     tasks = [
         (fpath, assignments, station_baselines, encoder, fs, window_seconds,
-         overlap, max_gap_fraction, freqmin, freqmax,
-         hard_negative_class, hard_negative_band)
+         overlap, max_gap_fraction, freqmin, freqmax)
         for fpath, assignments in file_to_assignments.items()
     ]
 
