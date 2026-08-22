@@ -450,6 +450,85 @@ def _window_amplitude_scores(windows, selection, sta_key, station_baselines):
     return scores
 
 
+def _pick_amplitude_matched(scores, quota, target_scores, n_bins=40, rng=None):
+    """
+    Indices of `quota` noise windows whose amplitude distribution mirrors
+    `target_scores` (the event windows), instead of a fixed percentile band.
+
+    Why this exists. `_pick_from_band` keeps the 75th-99th percentile of the
+    noise pool, which puts a hard floor under every negative's amplitude while
+    the positives have none. On a 6 s window that is harmless -- events carry S
+    and coda and are loud, so P(event | amplitude) rises monotonically. On a
+    P-only window it is not: cutting at 1.4 s post-P removes the loud phases,
+    35% of events end up quieter than the median mined noise, and below the
+    band's lower edge there is almost no noise at all. P(event | amplitude)
+    becomes U-shaped -- 0.67 in the quietest decile, 0.30 in the middle, 1.00
+    in the loudest -- and a model can learn "very quiet -> event", which is an
+    artifact of the mining rather than physics. In continuous data quiet
+    windows are overwhelmingly noise.
+
+    Matching the whole distribution rather than a central value is deliberate:
+    drawing noise "about as loud as the average event" leaves the two classes
+    with different amplitude *spreads*, so "extreme in either direction" stays
+    learnable. Quantile bins equalise the shape, not just the location.
+
+    The loud tail cannot be matched and should not be. Roughly a fifth of
+    events are louder than any window the pool offers below its 99th
+    percentile, and that cap is deliberate -- the loudest tail of screened
+    noise is where a catalogue-missed earthquake hides. Where a bin cannot be
+    filled, the shortfall is redistributed to the nearest bins that can, and
+    the caller reports the residual rather than pretending amplitude was fully
+    neutralised.
+
+    Args:
+        scores: Candidate noise amplitudes, in station-sigma units.
+        quota: How many to select.
+        target_scores: Event amplitudes, same units, defining the shape to match.
+        n_bins: Quantile bins of the target distribution to match across.
+        rng: Optional numpy Generator, for reproducibility.
+
+    Returns:
+        Array of indices into `scores`.
+    """
+    rng = rng or np.random.default_rng(0)
+    n = len(scores)
+    if quota >= n:
+        return np.arange(n)
+
+    edges = np.unique(np.quantile(target_scores, np.linspace(0, 1, n_bins + 1)))
+    if len(edges) < 2:
+        return _pick_from_band(scores, quota, (0.0, 0.99))
+    # Per-bin demand follows the target's own occupancy.
+    demand = np.histogram(target_scores, bins=edges)[0].astype(float)
+    demand = np.maximum(1, np.round(demand / demand.sum() * quota)).astype(int)
+
+    bin_of = np.digitize(scores, edges) - 1
+    pools = [np.flatnonzero(bin_of == b) for b in range(len(edges) - 1)]
+
+    chosen, shortfall = [], 0
+    for b, want in enumerate(demand):
+        pool = pools[b]
+        take = min(want, len(pool))
+        if take:
+            chosen.append(rng.choice(pool, size=take, replace=False))
+        shortfall += want - take
+
+    # Redistribute what the (mostly loud) empty bins could not supply, nearest
+    # first, so the shortfall does not silently re-bias the result upward.
+    if shortfall:
+        used = set(np.concatenate(chosen).tolist()) if chosen else set()
+        spare = np.array([i for i in range(n) if i not in used])
+        if len(spare):
+            order = np.argsort(np.abs(
+                scores[spare] - np.median(target_scores)), kind="stable")
+            chosen.append(spare[order[:shortfall]])
+
+    out = np.concatenate(chosen) if chosen else np.array([], dtype=int)
+    if len(out) > quota:
+        out = rng.choice(out, size=quota, replace=False)
+    return np.unique(out)
+
+
 def _pick_from_band(scores, quota, band):
     """
     Indices of `quota` items drawn from the `band` percentile slice of `scores`,
@@ -724,7 +803,9 @@ def _write_split_manifest(manifest_path: Path, entries: List[Tuple[str, str, str
 
 def _mine_hard_negatives_globally(file_to_assignments, station_baselines, fs,
                                   window_seconds, overlap, max_gap_fraction,
-                                  target_class, band, num_cores, splits):
+                                  target_class, band, num_cores, splits,
+                                  match_amplitude=False,
+                                  positive_class="01_earthquake"):
     """
     Replaces the mined class's per-file window QUOTAS with explicit per-file
     window WHITELISTS chosen by ranking every candidate window in a split
@@ -767,6 +848,32 @@ def _mine_hard_negatives_globally(file_to_assignments, station_baselines, fs,
                     continue
                 candidates[entry[0]].append((fpath, sta_key, w_idx, score))
 
+    # When matching, the positives define the amplitude shape to mirror, so
+    # they need scoring in the same station-sigma units. One extra read of the
+    # event files; the noise pass above already paid the same cost.
+    target_by_split = {s: [] for s in splits}
+    if match_amplitude:
+        print(f"[MATCH] Scoring '{positive_class}' windows to define the "
+              f"target amplitude distribution...")
+        pos_tasks, pos_split = [], {}
+        for fpath, assignments in file_to_assignments.items():
+            pos = {s: a for s, a in assignments.items() if a[1] == positive_class}
+            if not pos:
+                continue
+            pos_tasks.append((fpath, assignments, station_baselines, fs,
+                              window_seconds, overlap, max_gap_fraction,
+                              positive_class))
+            for sta_key, (split_name, _c, _o, _q) in pos.items():
+                pos_split[(fpath, sta_key)] = split_name
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores) as ex:
+            for i, (fpath, rows) in enumerate(ex.map(_score_windows_task, pos_tasks), 1):
+                if i % 2000 == 0:
+                    print(f"  ...{i}/{len(pos_tasks)} event files scored")
+                for sta_key, _w, score in rows:
+                    sp = pos_split.get((fpath, sta_key))
+                    if sp is not None:
+                        target_by_split[sp].append(score)
+
     whitelist: Dict[Tuple[Path, str], set] = {}
     for split_name in splits:
         cands = candidates[split_name]
@@ -779,7 +886,15 @@ def _mine_hard_negatives_globally(file_to_assignments, station_baselines, fs,
         if target <= 0:
             continue
         scores = np.array([c[3] for c in cands], dtype=np.float64)
-        chosen = _pick_from_band(scores, target, band)
+        tgt = np.asarray(target_by_split.get(split_name, ()), dtype=np.float64)
+        if match_amplitude and len(tgt):
+            chosen = _pick_amplitude_matched(scores, target, tgt)
+            unmatchable = float((tgt > scores.max()).mean())
+            print(f"  -> {split_name}: amplitude-matched to {len(tgt)} events; "
+                  f"{unmatchable:.1%} of events are louder than any candidate "
+                  f"noise window and cannot be matched")
+        else:
+            chosen = _pick_from_band(scores, target, band)
         for idx in chosen:
             fpath, sta_key, w_idx, _sc = cands[idx]
             whitelist.setdefault((fpath, sta_key), set()).add(w_idx)
@@ -828,6 +943,7 @@ def run_balanced_preprocessing(
     encoder=None,
     hard_negatives: bool = False,
     hard_negative_band: Tuple[float, float] = (0.75, 0.99),
+    match_negative_amplitude: bool = False,
 ):
     if encoder is None:
         encoder = RamImageEncoder(target_n)
@@ -1116,7 +1232,7 @@ def run_balanced_preprocessing(
         file_to_assignments = _mine_hard_negatives_globally(
             file_to_assignments, station_baselines, fs, window_seconds, overlap,
             max_gap_fraction, hard_negative_class, hard_negative_band,
-            num_cores, splits,
+            num_cores, splits, match_amplitude=match_negative_amplitude,
         )
 
     tasks = [

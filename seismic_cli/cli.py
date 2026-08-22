@@ -292,6 +292,18 @@ def generate_spec_dual_dataset_cmd(
                            "The upper bound matters: the loudest tail of screened noise is "
                            "where a catalog-missed earthquake hides, so mining it would put "
                            "positives into the negative class."),
+    match_negative_amplitude: bool = typer.Option(
+        False, help="Ignore --hard-negative-band and instead pick noise whose "
+                    "amplitude DISTRIBUTION mirrors the events'. The band puts a "
+                    "hard floor under every negative while positives have none; on "
+                    "a P-only window, where the loud phases are cut away, that makes "
+                    "P(event|amplitude) U-shaped and lets a model learn "
+                    "'very quiet -> event' -- an artifact of the mining, since in "
+                    "continuous data quiet windows are overwhelmingly noise. Matching "
+                    "the whole distribution rather than a central value matters: equal "
+                    "means with unequal spreads leaves 'extreme either way' learnable. "
+                    "The loudest ~20% of events exceed anything the pool offers and "
+                    "stay unmatched; the run reports that residual."),
     num_cores: Optional[int] = typer.Option(None, help="Worker processes (default: cpu_count - 1)."),
 ):
     """
@@ -333,6 +345,7 @@ def generate_spec_dual_dataset_cmd(
         min_baseline_seconds=min_baseline_seconds, num_cores=num_cores,
         generate_max=generate_max, encoder=encoder,
         hard_negatives=hard_negatives, hard_negative_band=tuple(hard_negative_band),
+        match_negative_amplitude=match_negative_amplitude,
     )
 
 

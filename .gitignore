@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 data*/
+
+# Generation run logs.
+*_ponly.log
